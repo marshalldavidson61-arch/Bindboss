@@ -1,5 +1,9 @@
-bindboss
+# Built binaries (CLI and test outputs)
+/bindboss
+/bindboss_cli
 hello-test
+hello-signed
+hello-tampered
 hello-with-deps
 ci-hello
 *.exe

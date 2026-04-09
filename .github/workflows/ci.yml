@@ -20,7 +20,10 @@ jobs:
           go-version: "1.23"
 
       - name: Test all packages
-        run: go test ./internal/... ./pkg/... -v -count=1
+        run: go test ./internal/... -v -count=1
+
+      - name: Build library package (no test files, just verify it compiles)
+        run: go build ./pkg/...
 
       - name: Build CLI
         run: go build -o bindboss_cli .
