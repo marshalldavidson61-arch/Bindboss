@@ -277,3 +277,83 @@ func TestToTOMLRoundTrip(t *testing.T) {
 		t.Errorf("Extract.Persist: got %v, want %v", roundtripped.Extract.Persist, orig.Extract.Persist)
 	}
 }
+// TestLoadInstallConfig verifies that the [install] section is parsed correctly.
+func TestLoadInstallConfig(t *testing.T) {
+	dir := t.TempDir()
+	tomlContent := `
+name = "myapp"
+run  = "julia main.jl"
+
+[install]
+enabled = true
+install_file = "install.json"
+`
+	if err := os.WriteFile(filepath.Join(dir, "bindboss.toml"), []byte(tomlContent), 0644); err != nil {
+		t.Fatalf("write toml: %v", err)
+	}
+
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if !cfg.Install.Enabled {
+		t.Error("Install.Enabled should be true")
+	}
+	if cfg.Install.ConfigFile != "install.json" {
+		t.Errorf("Install.ConfigFile: got %q, want %q", cfg.Install.ConfigFile, "install.json")
+	}
+}
+
+// TestLoadInstallConfigInline verifies inline install config is parsed.
+func TestLoadInstallConfigInline(t *testing.T) {
+	dir := t.TempDir()
+	tomlContent := `
+name = "myapp"
+run  = "julia main.jl"
+
+[install]
+enabled = true
+install_config = '{"title":"Test","steps":[{"type":"finish","title":"Done"}]}'
+`
+	if err := os.WriteFile(filepath.Join(dir, "bindboss.toml"), []byte(tomlContent), 0644); err != nil {
+		t.Fatalf("write toml: %v", err)
+	}
+
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if !cfg.Install.Enabled {
+		t.Error("Install.Enabled should be true")
+	}
+	if cfg.Install.ConfigInline == "" {
+		t.Error("Install.ConfigInline should not be empty")
+	}
+}
+
+// TestLoadNoInstallSection verifies backward compat — no [install] = defaults.
+func TestLoadNoInstallSection(t *testing.T) {
+	dir := t.TempDir()
+	tomlContent := `
+name = "oldapp"
+run  = "sh run.sh"
+`
+	if err := os.WriteFile(filepath.Join(dir, "bindboss.toml"), []byte(tomlContent), 0644); err != nil {
+		t.Fatalf("write toml: %v", err)
+	}
+
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// GRUG: no [install] section = Install zero value = Enabled=false.
+	if cfg.Install.Enabled {
+		t.Error("Install.Enabled should be false when no [install] section exists")
+	}
+	if cfg.Install.ConfigFile != "" {
+		t.Error("Install.ConfigFile should be empty")
+	}
+}

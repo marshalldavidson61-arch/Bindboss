@@ -254,6 +254,128 @@ Legacy v1 format (24-byte trailer, no hash/sig) is detected and read transparent
 
 ---
 
+## Install Wizard (GUI)
+
+bindboss supports a JSON-driven install wizard that replaces the basic "open browser, wait for Enter" dependency check with a guided multi-step installer experience.
+
+### Quick Start
+
+1. Create an `install.json` in your project directory:
+
+```json
+{
+  "title": "My App",
+  "version": "1.0",
+  "steps": [
+    {
+      "type": "welcome",
+      "title": "Welcome",
+      "content": "Welcome to My App! This wizard will install dependencies."
+    },
+    {
+      "type": "deps",
+      "title": "Dependencies",
+      "deps": [
+        {
+          "name": "Julia 1.9+",
+          "check": "julia --version",
+          "download_url": "https://julialang-s3.julialang.org/bin/linux/x64/1.10/julia-1.10.2-linux-x86_64.tar.gz",
+          "fallback_url": "https://julialang.org/downloads/",
+          "message": "Julia is required to run this application."
+        }
+      ]
+    },
+    {
+      "type": "finish",
+      "title": "Done",
+      "content": "All dependencies installed! The app will start now."
+    }
+  ]
+}
+```
+
+2. Enable the wizard in `bindboss.toml`:
+
+```toml
+[install]
+enabled = true
+install_file = "install.json"
+```
+
+3. Pack as usual:
+
+```sh
+bindboss pack ./myapp myapp --run="julia main.jl"
+```
+
+On first run, the packed binary launches the install wizard instead of the basic dep check.
+
+### Step Types
+
+| Type | Description |
+|------|-------------|
+| `welcome` | Show a greeting message. User presses Enter to continue. |
+| `license` | Show license text. User must type "accept" to proceed. |
+| `deps` | Check dependencies, download and install missing ones via HTTP. |
+| `message` | Show informational text. User presses Enter to continue. |
+| `finish` | Show completion message. Wizard exits. |
+
+### Dep Definition Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Human-readable name (e.g. "Julia 1.9+") |
+| `check` | yes | Command to test presence — exit 0 = installed |
+| `download_url` | * | Direct HTTP(S) download link for the installer |
+| `fallback_url` | * | Browser URL if download fails or is unavailable |
+| `file_name` | no | Override the downloaded filename |
+| `hash` | no | Expected SHA-256 hex digest for verification |
+| `message` | no | Extra context shown to the user |
+
+\* At least one of `download_url` or `fallback_url` is required.
+
+### Download Behavior
+
+The install wizard downloads dependency installers directly via HTTP sockets — **no browser is opened**. The flow for each missing dependency:
+
+1. HTTP GET the download URL with progress bar
+2. Optionally verify SHA-256 hash of downloaded file
+3. Launch the downloaded installer (platform-aware: .exe, .msi, .dmg, .sh, etc.)
+4. Wait for user to confirm installation is complete
+5. Re-check the dependency with the check command
+6. Retry if still not found
+
+### Navigation
+
+- **Enter** — proceed to next step
+- **"back" + Enter** — go back one step
+- **"retry" + Enter** — re-download a failed dependency
+- **Ctrl+C** — abort the wizard entirely
+
+### Inline vs File Config
+
+The install wizard JSON can be provided two ways in `bindboss.toml`:
+
+```toml
+# Option 1: Reference a JSON file in the packed directory
+[install]
+enabled = true
+install_file = "install.json"
+
+# Option 2: Inline the JSON directly (useful for small configs)
+[install]
+enabled = true
+install_config = '{"title":"My App","steps":[...]}'
+```
+
+If both are set, `install_config` (inline) takes priority.
+
+### Backward Compatibility
+
+If no `[install]` section is present in `bindboss.toml` (or `enabled = false`), the stub falls back to the original dep check behavior: check command → open browser → wait for Enter → re-check. Existing binaries are unaffected.
+
+---
+
 ## Design Philosophy
 
 - **Error-first**: every failure path returns a descriptive `!!! FATAL:` error. Nothing silent.

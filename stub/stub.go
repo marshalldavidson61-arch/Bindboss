@@ -8,7 +8,8 @@
 //   2. If BINDBOSS_VERIFY=1, re-read entire payload and check SHA-256 hash
 //   3. Make a temp dir and extract payload (tar.gz) into it
 //   4. Read bindboss.toml from extracted dir
-//   5. First run only: check deps, open browser if missing, wait for install
+//   5. First run only: if install wizard config exists, run guided installer;
+//      otherwise check deps, download missing ones via HTTP, wait for install
 //   6. Write dep state so next run skips step 5
 //   7. Set extra env vars from config
 //   8. Run pre_run hooks
@@ -63,6 +64,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -75,6 +77,7 @@ import (
 	"github.com/marshalldavidson61-arch/bindboss/internal/archive"
 	"github.com/marshalldavidson61-arch/bindboss/internal/checker"
 	"github.com/marshalldavidson61-arch/bindboss/internal/config"
+	"github.com/marshalldavidson61-arch/bindboss/internal/installer"
 	"github.com/marshalldavidson61-arch/bindboss/internal/hooks"
 	"github.com/marshalldavidson61-arch/bindboss/internal/state"
 )
@@ -172,19 +175,34 @@ func main() {
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 6: Dependency check (first run only)
+	// STEP 6: Dependency check / Install wizard (first run only)
+	// GRUG: if install wizard config exists, run the guided installer.
+	// if not, fall back to the old checker flow. backward compat = sacred.
 	// ------------------------------------------------------------------
-	if len(cfg.Needs) > 0 {
+	hasNeeds := len(cfg.Needs) > 0
+	hasInstall := cfg.Install.Enabled
+
+	if hasNeeds || hasInstall {
 		st, err := state.Load(cfg.Name)
 		if err != nil {
 			fatalf("%v", err)
 		}
 
 		if !st.Checked {
-			fmt.Fprintf(os.Stderr, "[bindboss] first run — checking dependencies...\n")
-			if err := checker.CheckAll(cfg); err != nil {
-				fatalf("%v", err)
+			if hasInstall {
+				// GRUG: install wizard path. guided UI. downloads. the works.
+				fmt.Fprintf(os.Stderr, "[bindboss] first run — launching install wizard...\n")
+				if err := runInstallWizard(cfg, extractDir); err != nil {
+					fatalf("%v", err)
+				}
+			} else {
+				// GRUG: legacy path. no wizard. just check deps and open browser.
+				fmt.Fprintf(os.Stderr, "[bindboss] first run — checking dependencies...\n")
+				if err := checker.CheckAll(cfg); err != nil {
+					fatalf("%v", err)
+				}
 			}
+
 			if err := state.MarkChecked(cfg.Name); err != nil {
 				// GRUG: state write fail = not fatal. we just re-check next time.
 				// annoying but correct. warn and continue.
@@ -192,7 +210,6 @@ func main() {
 			}
 		}
 	}
-
 	// ------------------------------------------------------------------
 	// STEP 7: Build environment
 	// ------------------------------------------------------------------
@@ -373,6 +390,57 @@ func splitCmd(s string) []string {
 		parts = append(parts, current.String())
 	}
 	return parts
+}
+
+// runInstallWizard loads and executes the JSON install wizard.
+// Reads install config from either inline TOML field or a file in extractDir.
+//
+// GRUG: two sources for the JSON config:
+//   1. cfg.Install.ConfigInline — JSON embedded directly in bindboss.toml
+//   2. cfg.Install.ConfigFile   — path to JSON file in the packed directory
+// inline wins if both are set. neither set = FATAL.
+//
+// ---
+// ACADEMIC: The install wizard is a finite state machine driven by a JSON
+// configuration. It runs as a blocking call during the stub's first-run path.
+// On success, the stub continues to the normal execution flow. On failure or
+// user abort, the stub exits with a FATAL error and no state is persisted —
+// the next run will re-trigger the wizard.
+func runInstallWizard(cfg config.Config, extractDir string) error {
+	var jsonData []byte
+
+	if cfg.Install.ConfigInline != "" {
+		// GRUG: inline JSON in TOML. just use it directly.
+		jsonData = []byte(cfg.Install.ConfigInline)
+	} else if cfg.Install.ConfigFile != "" {
+		// GRUG: JSON file in packed directory. read it.
+		path := filepath.Join(extractDir, cfg.Install.ConfigFile)
+		var err error
+		jsonData, err = os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf(
+				"!!! FATAL: cannot read install config %q: %w\n"+
+					"  Make sure the file exists in the packed directory.", path, err)
+		}
+	} else {
+		// GRUG: install.enabled=true but no config provided. that is a config mistake.
+		return fmt.Errorf(
+			"!!! FATAL: install.enabled=true but no install_config or install_file provided\n" +
+				"  Set install_config (inline JSON) or install_file (path) in bindboss.toml")
+	}
+
+	// GRUG: validate JSON is at least well-formed before handing to installer
+	if !json.Valid(jsonData) {
+		return fmt.Errorf("!!! FATAL: install config is not valid JSON")
+	}
+
+	installCfg, err := installer.Parse(jsonData)
+	if err != nil {
+		return err
+	}
+
+	runner := installer.NewRunner(installCfg)
+	return runner.Run()
 }
 
 // fatalf prints a fatal error to stderr and exits 1. Never silent.

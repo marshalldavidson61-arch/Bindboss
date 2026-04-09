@@ -19,6 +19,11 @@
 // so the stub always reads a single authoritative bindboss.toml regardless
 // of how the binary was packed.
 //
+// The [install] section enables an optional JSON-driven install wizard GUI
+// that replaces the raw dep-check-and-open-browser flow with a guided
+// multi-step installer. The wizard config can be inlined as a JSON string
+// or referenced as a file path relative to the packed directory.
+//
 // The [hooks] section uses a declarative array-of-strings model rather than
 // a scripting language. Each string is parsed as argv (no shell expansion)
 // by hooks.splitCmd. This keeps the config readable and the execution surface
@@ -63,6 +68,19 @@ type Hooks struct {
 	PostRun []string `toml:"post_run"` // run after main exits — exec_mode=fork ONLY on Unix
 }
 
+// Install configures the JSON-driven install wizard GUI.
+// When present, the stub runs a guided installer on first run instead of the
+// raw dep-check-and-open-browser flow. The install config can be an inline
+// JSON string or a path to an install.json file inside the packed directory.
+//
+// GRUG: install_config = inline JSON. install_file = path to JSON file.
+// pick one. if both set, install_config wins. if neither set, no wizard.
+type Install struct {
+	Enabled      bool   `toml:"enabled"`        // master switch — false = skip wizard entirely
+	ConfigInline string `toml:"install_config"` // inline JSON string with wizard definition
+	ConfigFile   string `toml:"install_file"`   // path to install.json relative to packed dir
+}
+
 // Config is the full picture for one packed binary.
 type Config struct {
 	Name     string  `toml:"name"`      // display name — used in logs and state file path
@@ -72,6 +90,7 @@ type Config struct {
 	Needs    []Dep   `toml:"needs"`     // runtime deps to check on first run
 	Extract  Extract `toml:"extract"`
 	Hooks    Hooks   `toml:"hooks"`
+	Install  Install `toml:"install"` // optional install wizard GUI config
 }
 
 // DefaultConfig returns safe starting values.
