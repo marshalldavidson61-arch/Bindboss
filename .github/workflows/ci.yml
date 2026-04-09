@@ -56,23 +56,10 @@ jobs:
 
       - name: Integration — tamper detection
         run: |
-          # Flip a byte in the payload and verify that VerifyHash catches it
-          python3 -c "
-          import sys
-          data = bytearray(open('hello-test','rb').read())
-          # payload starts at byte 9 of a typical stub... actually just flip near the middle
-          mid = len(data) // 2
-          data[mid] ^= 0xFF
-          open('hello-tampered','wb').write(data)
-          os.chmod('hello-tampered', 0o755)
-          " 2>/dev/null || python3 -c "
-          import os
-          data = bytearray(open('hello-test','rb').read())
-          mid = len(data) // 2
-          data[mid] ^= 0xFF
-          open('hello-tampered','wb').write(bytes(data))
-          os.chmod('hello-tampered', 0o755)
-          "
+          # Use tamper_helper.py to flip a byte inside the payload region
+          # (reads the v2 trailer to find tar_offset, then flips a byte just past it)
+          python3 tamper_helper.py hello-test hello-tampered
+
           # verify should FAIL (exit non-zero) on tampered binary
           if ./bindboss_cli verify hello-tampered 2>/dev/null; then
             echo "FAIL: verify passed on tampered binary"
