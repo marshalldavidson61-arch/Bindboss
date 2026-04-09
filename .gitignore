@@ -1,0 +1,6 @@
+bindboss
+hello-test
+hello-with-deps
+ci-hello
+*.exe
+testdata/ci-hello/
