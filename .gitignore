@@ -1,5 +1,4 @@
 # Built binaries (CLI and test outputs)
-/bindboss
 /bindboss_cli
 hello-test
 hello-signed
@@ -8,3 +7,6 @@ hello-with-deps
 ci-hello
 *.exe
 testdata/ci-hello/
+
+# Working notes (not for distribution)
+todo.md
