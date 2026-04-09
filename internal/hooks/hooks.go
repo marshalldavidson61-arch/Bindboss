@@ -1,31 +1,38 @@
 // hooks.go
 // =============================================================================
-// GRUG: This is the hooks cave. Runs pre/post commands before and after the
-// main run command. Hooks are declared in bindboss.toml — no embedded VM,
-// no Lua, no scripts that need a runtime. Just a list of shell commands that
-// run in order. If one fails, we stop. No silent failures.
+// GRUG: grug want to run setup before main command. grug want cleanup after.
+// hooks do that. put list of commands in bindboss.toml under [hooks].
+// pre_run fires before main. post_run fires after.
+// one hook fail = everything stop. no silent half-run. no skipping.
 //
-// ACADEMIC: The hook system follows a declarative pipeline model. Each hook
-// is an independent process invocation. Hooks share the same working directory
-// and environment as the run command, plus two injected variables:
+// GRUG: hooks are NOT shell. "sh -c '...'" if you need shell features.
+// no pipes. no $() expansion. no &&. just argv. simple. safe.
 //
-//   BINDBOSS_EXTRACT_DIR  — absolute path to the extracted payload directory
-//   BINDBOSS_BINARY_NAME  — basename of the packed binary being run
+// GRUG: two magic env vars injected into every hook:
+//   BINDBOSS_EXTRACT_DIR  = where files were unpacked
+//   BINDBOSS_BINARY_NAME  = name of the binary being run
 //
-// Hooks are NOT run through a shell (no $(...) expansion, no pipes). If you
-// need shell features, hook command should be: "sh -c 'your shell stuff here'".
-// This is intentional: shell expansion in hooks is a security surface.
+// GRUG: post_run only fires on Windows or exec_mode=fork.
+// on Unix with exec_mode=exec (default), syscall.Exec replaces this process.
+// grug is gone. post_run cannot run. this is documented, not a bug.
 //
-// Hook execution order:
-//   1. pre_run hooks  — run before dep check and before the main command
-//   2. (main run command executes)
-//   3. post_run hooks — run after the main command exits (Windows only;
-//      on Unix syscall.Exec replaces us so post_run cannot fire)
+// -----------------------------------------------------------------------------
+// ACADEMIC FOOTER:
+// The hook system follows a declarative sequential pipeline model. Each hook
+// is an independent process invocation via exec.Command — not a shell eval.
+// This eliminates shell injection as an attack surface at the cost of requiring
+// explicit "sh -c" for shell features.
 //
-// GRUG NOTE on post_run: On Unix we use syscall.Exec which replaces this
-// process entirely. post_run hooks physically cannot run after that. They
-// are only meaningful on Windows (cmd.Run path) or if you set exec_mode="fork"
-// in bindboss.toml. Document this clearly so users aren't surprised.
+// Hooks share working directory (extractDir) and environment with the run
+// command, plus two injected context variables. Execution is strictly ordered:
+// hook[0] completes before hook[1] starts. First non-zero exit terminates the
+// pipeline with a FATAL error — partial execution is worse than no execution.
+//
+// The post_run / exec_mode interaction is a fundamental consequence of
+// syscall.Exec(2): it replaces the calling process image entirely. There is
+// no return path and no deferred cleanup. The fork path (exec_mode="fork")
+// uses os/exec.Cmd.Run() which keeps the stub alive, enabling post_run and
+// cleanup at the cost of a wrapper process in the process tree.
 // =============================================================================
 
 package hooks
@@ -37,18 +44,15 @@ import (
 	"strings"
 )
 
-// Runner executes a list of hook commands in order, stopping on first failure.
+// Runner executes hookCmds in order. Stops on first failure — no silent skips.
 // extractDir and binaryName are injected as env vars for each hook process.
-// env is the base environment (usually os.Environ() + cfg.Env).
-//
-// Returns a non-nil error if any hook exits non-zero or cannot be started.
-// Never silently skips a hook failure.
+// env is the base environment (os.Environ() + cfg.Env).
 func Runner(hookCmds []string, extractDir, binaryName string, env []string) error {
 	if len(hookCmds) == 0 {
 		return nil
 	}
 
-	// GRUG: Inject bindboss context into the hook environment.
+	// GRUG: inject context so hooks know where they are and what binary called them
 	hookEnv := append(env,
 		"BINDBOSS_EXTRACT_DIR="+extractDir,
 		"BINDBOSS_BINARY_NAME="+binaryName,
@@ -57,8 +61,7 @@ func Runner(hookCmds []string, extractDir, binaryName string, env []string) erro
 	for i, raw := range hookCmds {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
-			// GRUG: Empty hook strings are a config mistake, not intentional no-ops.
-			// Warn but don't fatal — the user may have trailing commas in their toml array.
+			// GRUG: empty string in hooks array = config mistake, not intentional no-op
 			fmt.Fprintf(os.Stderr, "[bindboss] warning: hook[%d] is empty string — skipping\n", i)
 			continue
 		}
@@ -68,7 +71,6 @@ func Runner(hookCmds []string, extractDir, binaryName string, env []string) erro
 			return fmt.Errorf("!!! FATAL: hook[%d] %q parsed to empty argv", i, raw)
 		}
 
-		// GRUG: Resolve the hook binary from PATH.
 		cmdPath, err := exec.LookPath(parts[0])
 		if err != nil {
 			return fmt.Errorf(
@@ -96,7 +98,6 @@ func Runner(hookCmds []string, extractDir, binaryName string, env []string) erro
 
 // splitCmd splits a shell-style command string into argv tokens.
 // Handles single and double quoted strings. No shell expansion.
-// Exported so tests and the stub can share the same implementation.
 func splitCmd(s string) []string {
 	s = strings.TrimSpace(s)
 	if s == "" {

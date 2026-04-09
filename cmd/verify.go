@@ -1,21 +1,45 @@
 // verify.go
 // =============================================================================
-// GRUG: The verify command. Checks that a packed binary's payload hash
-// matches its stored hash, and optionally verifies its Ed25519 signature.
-// If either check fails — FATAL. No "probably fine" output.
+// GRUG: The verify command. Grug want to know: is this binary intact?
+// Did someone tamper with it? Did the download corrupt it?
+// `bindboss verify ./myapp` answers. Pass = intact. Fail = !!! FATAL.
+// No "probably fine". No warnings. No partial passes. Binary or nothing.
 //
-// ACADEMIC: Two independent integrity checks are available:
+// Two checks, both optional independently:
+//   1. Hash check (always runs): recompute SHA-256 of payload, compare to
+//      stored hash in v2 trailer. Catches corruption and casual tampering.
+//      Does not require any key.
+//   2. Sig check (--pubkey=<file>): verify Ed25519 signature in trailer
+//      against the payload hash using the public key. Catches intentional
+//      tampering by anyone who does not have the private key.
 //
-//  1. Hash verification: re-reads the raw tar.gz bytes from the binary,
-//     computes SHA-256, compares against the stored hash in the v2 trailer.
-//     Detects corruption and casual tampering. Does not require a key.
+// v1 binaries have no trailer hash. Grug cannot verify them.
+// Solution: repack with current bindboss. v2 trailers always include hash.
 //
-//  2. Signature verification: checks the Ed25519 signature in the trailer
-//     against the payload hash using the provided public key. Detects
-//     intentional tampering — an attacker would need the private key to
-//     produce a valid signature for a modified payload.
+// ---
+// ACADEMIC: Two independent integrity invariants are checked in sequence:
 //
-// Both checks can run independently. --pubkey is only required for sig check.
+//   Invariant 1 — Payload hash integrity:
+//     archive.VerifyHash re-reads the raw tar.gz bytes from the binary
+//     (using the tar_offset stored in the v2 trailer), computes SHA-256,
+//     and compares against the 32-byte hash stored in the trailer.
+//     This detects single-bit corruption, truncation, and casual byte-flips.
+//     SHA-256 provides 128-bit preimage resistance — finding a modified
+//     payload that produces the same hash requires ~2^128 hash evaluations,
+//     which is computationally infeasible.
+//
+//   Invariant 2 — Ed25519 signature validity (optional):
+//     archive.VerifySig calls ed25519.Verify(pubKey, SHA-256(payload), sig)
+//     where sig is the 64-byte value stored in the v2 trailer.
+//     Ed25519 verification is deterministic and constant-time in the Go
+//     standard library. A valid signature proves the payload was signed by
+//     the holder of the corresponding private key at pack time — an attacker
+//     who modifies the payload cannot produce a valid signature without the
+//     private key (Ed25519 EUF-CMA security).
+//
+//   The two checks are independent: a binary can pass hash check and fail
+//   sig check (e.g., binary was packed without --sign, then someone adds a
+//   fake zero signature). Running both provides defense in depth.
 // =============================================================================
 
 package cmd
@@ -56,6 +80,7 @@ func (c *VerifyCmd) Usage() string {
 }
 
 func (c *VerifyCmd) Run(args []string) error {
+	// GRUG: separate positionals from flags. binary path is positional.
 	var positionals, flagArgs []string
 	for _, a := range args {
 		if len(a) > 0 && a[0] == '-' {
@@ -76,13 +101,14 @@ func (c *VerifyCmd) Run(args []string) error {
 
 	// ------------------------------------------------------------------
 	// Step 1: Hash verification (always)
+	// GRUG: no hash = v1 binary. cannot verify. tell user to repack.
 	// ------------------------------------------------------------------
 	fmt.Printf("[bindboss] verifying payload hash: %s\n", binPath)
 	if err := archive.VerifyHash(binPath); err != nil {
 		return err
 	}
 
-	// Print the stored hash for reference
+	// GRUG: print the actual hash so user can compare against a known-good value.
 	info, err := archive.FindPayload(binPath)
 	if err != nil {
 		return err
@@ -91,7 +117,7 @@ func (c *VerifyCmd) Run(args []string) error {
 	fmt.Printf("[bindboss] ✓ hash OK: %x\n", info.Hash)
 
 	// ------------------------------------------------------------------
-	// Step 2: Signature verification (if --pubkey provided)
+	// Step 2: Signature verification (--pubkey only)
 	// ------------------------------------------------------------------
 	if c.pubKey != "" {
 		fmt.Printf("[bindboss] verifying Ed25519 signature with: %s\n", c.pubKey)
@@ -100,10 +126,13 @@ func (c *VerifyCmd) Run(args []string) error {
 			return err
 		}
 		if err := archive.VerifySig(binPath, pub); err != nil {
+			// GRUG: sig bad = !!! FATAL. not a warning. not "probably fine".
 			return err
 		}
 		fmt.Printf("[bindboss] ✓ signature OK\n")
 	} else {
+		// GRUG: no --pubkey = just note whether binary is signed or not.
+		// user may not have the .pub file handy. not an error.
 		if info.SigPresent {
 			fmt.Printf("[bindboss]   note: binary is signed — use --pubkey to verify signature\n")
 		} else {

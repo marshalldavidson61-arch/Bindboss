@@ -1,35 +1,61 @@
 // stub.go
 // =============================================================================
-// GRUG: This is the stub cave. When a user runs a bindboss-packed binary,
-// THIS is the code that executes. It:
-//   1. Locates its own payload (the appended tar.gz)
-//   2. Optionally verifies the payload hash (if BINDBOSS_VERIFY is set)
-//   3. Checks deps on first run (skips on subsequent runs via state file)
-//   4. Runs pre_run hooks
-//   5. Extracts the packed directory to a temp or persist location
-//   6. Sets environment variables from config
-//   7. Execs the run command with full stdin/stdout/stderr passthrough
-//   8. Runs post_run hooks (exec_mode="fork" only — see note below)
-//   9. Cleans up the tmpdir on exit (unless persist)
-//  10. Exits with the child's exit code
+// GRUG: This is the stub cave. THE most important file. When human double-clicks
+// a bindboss-packed binary, THIS code runs. Not bindboss CLI. THIS.
 //
-// ACADEMIC: The exec model used here is NOT os/exec.Cmd.Run(). We use
-// syscall.Exec (on Unix) which replaces the current process image entirely
-// with the child. This means the child process IS the process — PID stays the
-// same, signal handling is clean, and there's no wrapper overhead.
-// On Windows, syscall.Exec is not available, so we fall back to cmd.Run()
-// with manual signal forwarding via os/signal.
+// Grug stub do ten things in order:
+//   1. Find own binary on disk (payload appended to end of THIS file)
+//   2. If BINDBOSS_VERIFY=1, re-read entire payload and check SHA-256 hash
+//   3. Make a temp dir and extract payload (tar.gz) into it
+//   4. Read bindboss.toml from extracted dir
+//   5. First run only: check deps, open browser if missing, wait for install
+//   6. Write dep state so next run skips step 5
+//   7. Set extra env vars from config
+//   8. Run pre_run hooks
+//   9. Exec the run command (syscall.Exec on Unix = replace self with child)
+//  10. If exec_mode=fork: run post_run hooks and clean up tmpdir after child exits
 //
-// exec_mode="fork" forces cmd.Run() on Unix too — useful when post_run hooks
-// must fire, at the cost of a wrapper process. Default is "exec".
+// Step 9 is the key. syscall.Exec REPLACES this process. The child IS grug.
+// No wrapper overhead. No zombie stub. Signal handling is clean.
+// post_run hooks CANNOT fire in exec mode — grug is gone. Use fork mode if
+// you need post_run.
 //
-// The stub is compiled separately as part of the bindboss pack step and its
-// binary is embedded into the bindboss packer via go:embed. When packing,
-// the appropriate stub binary for the target platform is written as the output
-// file base, then the payload is appended.
+// Build tag "stub" isolates this file. Only compiled as the standalone stub
+// binary (go build -tags stub), not as part of the main bindboss CLI.
+// The CLI packs THIS compiled binary as the output base, then appends payload.
 //
-// Build tag "stub" ensures this file is only compiled as the standalone stub
-// binary, not as part of the main bindboss CLI.
+// ---
+// ACADEMIC: The stub's execution model has two paths depending on exec_mode:
+//
+//   exec (default, Unix only):
+//     syscall.Exec(2) is invoked, which calls the execve(2) syscall directly.
+//     This replaces the process image entirely — the stub's stack, heap, and
+//     file descriptors are replaced by the child. The PID is preserved. stdin,
+//     stdout, and stderr are inherited by the kernel without any pipe setup.
+//     Signal disposition is reset to defaults by execve. post_run hooks
+//     CANNOT fire because the stub process no longer exists after execve.
+//
+//   fork (explicit) or Windows (forced):
+//     os/exec.Cmd.Start() + cmd.Wait() is used. The stub process remains alive
+//     as a wrapper. Signals (SIGINT, SIGTERM) are forwarded to the child process
+//     via os/signal + cmd.Process.Signal(). post_run hooks fire after cmd.Wait()
+//     returns. tmpdir cleanup runs before os.Exit(childCode).
+//
+// Payload layout (v2 trailer, 121 bytes appended to stub ELF/PE/Mach-O):
+//   [8 bytes  big-endian uint64  tar_offset  ]
+//   [32 bytes SHA-256 of raw tar.gz bytes    ]
+//   [64 bytes Ed25519 signature OR zeros     ]
+//   [1 byte   flags: bit0=hash_present,      ]
+//              bit1=sig_present              ]
+//   [16 bytes magic: "BINDBOSS_PAYLOAD\x02"  ]
+//
+// v1 trailer (24 bytes, legacy) is detected by the "BINDBOSS_PAYLOAD\x01"
+// magic suffix and read transparently — no hash/sig available in v1.
+//
+// HashDir canonical traversal (used by VerifyHash) uses sorted os.ReadDir
+// with null-terminated path framing: for each file, SHA-256 absorbs
+// len(relPath)||relPath||'\0'||fileBytes. This ensures hash stability
+// across filesystems and OS-dependent directory enumeration order.
 // =============================================================================
 
 //go:build stub
@@ -54,19 +80,20 @@ import (
 )
 
 func main() {
-	// GRUG: Find our own executable path. This is where the payload is appended.
+	// GRUG: find where grug lives on disk. payload is appended to THIS file.
 	selfPath, err := os.Executable()
 	if err != nil {
 		fatalf("cannot locate own executable: %v", err)
 	}
-	// GRUG: Resolve symlinks — the payload is in the real binary, not the link.
+	// GRUG: resolve symlinks — payload is in the real binary, not the symlink.
+	// os.Executable() may return a symlink path on some systems.
 	selfPath, err = filepath.EvalSymlinks(selfPath)
 	if err != nil {
 		fatalf("cannot resolve symlink to own executable: %v", err)
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 1: Find and validate the appended payload
+	// STEP 1: Locate payload trailer
 	// ------------------------------------------------------------------
 	payloadInfo, err := archive.FindPayload(selfPath)
 	if err != nil {
@@ -76,20 +103,20 @@ func main() {
 
 	// ------------------------------------------------------------------
 	// STEP 2: Optional hash verification
-	// GRUG: If BINDBOSS_VERIFY=1 is set, verify the payload hash before
-	// extraction. This catches tampering or corruption before we exec anything.
-	// Off by default — verification adds a full re-read of the payload.
+	// GRUG: BINDBOSS_VERIFY=1 = re-read whole payload and check SHA-256.
+	// Catches corruption and tampering before grug runs anything.
+	// Off by default — verification = full extra read of payload = slower.
 	// ------------------------------------------------------------------
 	if os.Getenv("BINDBOSS_VERIFY") == "1" {
 		if !payloadInfo.HashPresent {
 			fatalf("BINDBOSS_VERIFY=1 but binary %q has no stored hash (v1 format) — repack to enable verification", selfPath)
 		}
-		// GRUG: Close and reopen for verification — FindPayload consumed the reader.
+		// GRUG: FindPayload already consumed the reader. close and reopen.
 		payloadInfo.Reader.Close()
 		if err := archive.VerifyHash(selfPath); err != nil {
 			fatalf("%v", err)
 		}
-		// Reopen for extraction
+		// reopen for extraction below
 		payloadInfo, err = archive.FindPayload(selfPath)
 		if err != nil {
 			fatalf("%v", err)
@@ -107,14 +134,15 @@ func main() {
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 4: Extract payload (skip if persist dir already exists with content)
+	// STEP 4: Extract payload
+	// GRUG: if persist dir already has content, skip re-extraction.
+	// fresh tmpdir = always extract. persist dir with files = skip.
 	// ------------------------------------------------------------------
 	needsExtract := true
 	if _, statErr := os.Stat(extractDir); statErr == nil {
-		// GRUG: Directory exists. If we're in persist mode and it has content,
-		// skip re-extraction. If it's empty or this is a fresh tmpdir, extract.
 		entries, _ := os.ReadDir(extractDir)
 		if len(entries) > 0 {
+			// GRUG: already extracted to persist dir. skip the work.
 			needsExtract = false
 		}
 	}
@@ -137,7 +165,8 @@ func main() {
 		fatalf("%v", err)
 	}
 
-	// GRUG: Use binary filename as name if config doesn't provide one.
+	// GRUG: if packer didn't set a name in toml, use the binary filename.
+	// state file and logs use this name — should be human-readable.
 	if cfg.Name == "" {
 		cfg.Name = binaryName
 	}
@@ -157,8 +186,8 @@ func main() {
 				fatalf("%v", err)
 			}
 			if err := state.MarkChecked(cfg.Name); err != nil {
-				// GRUG: Non-fatal — state write failure means we re-check next time,
-				// which is annoying but not broken. Warn, don't die.
+				// GRUG: state write fail = not fatal. we just re-check next time.
+				// annoying but correct. warn and continue.
 				fmt.Fprintf(os.Stderr, "[bindboss] warning: could not save dep state: %v\n", err)
 			}
 		}
@@ -169,6 +198,8 @@ func main() {
 	// ------------------------------------------------------------------
 	env := os.Environ()
 	for _, kv := range cfg.Env {
+		// GRUG: append config env on top of process env. config wins on duplicates
+		// because os.Environ() is read by the child in order, last write wins.
 		env = append(env, kv)
 	}
 
@@ -183,68 +214,71 @@ func main() {
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 9: Parse and exec run command
+	// STEP 9: Parse run command and exec
 	// ------------------------------------------------------------------
 	parts := splitCmd(cfg.Run)
 	if len(parts) == 0 {
 		fatalf("run command is empty after parsing — check bindboss.toml 'run' field")
 	}
 
-	// GRUG: Change to the extracted directory before exec so relative paths
-	// in the run command (e.g. "sh run.sh") resolve correctly.
+	// GRUG: chdir to extract dir so relative paths in run command work.
+	// "sh run.sh" only works if cwd = the dir that contains run.sh.
 	if err := os.Chdir(extractDir); err != nil {
 		fatalf("cannot chdir to extract dir %q: %v", extractDir, err)
 	}
 
-	// GRUG: Resolve the command binary from PATH if it's not an absolute path.
+	// GRUG: resolve run command from PATH if it is not absolute.
+	// "julia" needs to be found somewhere on PATH.
 	cmdPath, err := exec.LookPath(parts[0])
 	if err != nil {
 		fatalf("run command %q not found on PATH: %v", parts[0], err)
 	}
 
 	argv := append([]string{cmdPath}, parts[1:]...)
-	// GRUG: Forward any extra args the user passed to us directly to the child.
+	// GRUG: forward any extra args the user passed to us directly to the child.
+	// "mypacked arg1 arg2" → child sees arg1 arg2.
 	argv = append(argv, os.Args[1:]...)
 
 	// ------------------------------------------------------------------
-	// STEP 10: Choose exec strategy based on exec_mode and platform
+	// STEP 10: Choose exec strategy
 	// ------------------------------------------------------------------
+	// GRUG: fork mode = keep stub alive. needed for post_run and cleanup.
+	// exec mode = replace self with child. clean, fast, no wrapper.
+	// windows always forks — syscall.Exec not available on windows.
 	useFork := cfg.ExecMode == "fork" || runtime.GOOS == "windows"
 
 	if !useFork {
-		// GRUG: Unix exec path — replace this process with the child.
-		// Clean and signal-safe. post_run hooks CANNOT fire after this.
-		// The OS handles stdin/stdout/stderr inheritance automatically.
+		// GRUG: Unix exec path. this process becomes the child.
+		// nothing runs after this line if exec succeeds.
+		// tmpdir cleanup will NOT run — OS cleans up on reboot or user runs reset.
 		if cleanup != nil {
-			// GRUG: On Unix exec path, deferred cleanup won't run.
-			// The tmpdir will be cleaned up by the OS on reboot, or
-			// the user can run `bindboss reset <name>`.
-			// If Cleanup=true and Persist=false, log a note.
 			fmt.Fprintf(os.Stderr, "[bindboss] note: tmpdir %s will not be auto-cleaned (exec mode)\n", extractDir)
 		}
 		if err := syscall.Exec(cmdPath, argv, env); err != nil {
 			fatalf("exec failed: %v", err)
 		}
-		// GRUG: Unreachable after syscall.Exec succeeds.
+		// GRUG: unreachable. syscall.Exec replaces this process on success.
 	}
 
-	// Fork path: keep stub alive so post_run and cleanup can fire.
+	// ------------------------------------------------------------------
+	// Fork path: stub stays alive as wrapper
+	// ------------------------------------------------------------------
 	exitCode := runWithSignalForwarding(cmdPath, argv, env, extractDir)
 
 	// ------------------------------------------------------------------
-	// STEP 11: post_run hooks (fork/Windows path only)
+	// STEP 11: post_run hooks (fork / Windows path only)
+	// GRUG: main command already finished. post_run failure = warn, not die.
+	// we cannot un-run the main command. exit code is already set.
 	// ------------------------------------------------------------------
 	if len(cfg.Hooks.PostRun) > 0 {
 		fmt.Fprintf(os.Stderr, "[bindboss] running post_run hooks...\n")
 		if err := hooks.Runner(cfg.Hooks.PostRun, extractDir, cfg.Name, env); err != nil {
-			// GRUG: post_run failure is logged but doesn't change the exit code.
-			// The main command already finished — we can't un-run it.
 			fmt.Fprintf(os.Stderr, "[bindboss] warning: post_run hook failed: %v\n", err)
 		}
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 12: Cleanup (fork/Windows path only)
+	// STEP 12: Cleanup (fork / Windows path only)
 	// ------------------------------------------------------------------
 	if cleanup != nil {
 		cleanup()
@@ -253,8 +287,8 @@ func main() {
 	os.Exit(exitCode)
 }
 
-// runWithSignalForwarding runs the child command with os/signal forwarding
-// so Ctrl+C reaches the child instead of killing the wrapper.
+// runWithSignalForwarding runs the child command with signal forwarding so
+// Ctrl+C (SIGINT) and SIGTERM reach the child instead of killing the wrapper.
 // Returns the child's exit code.
 func runWithSignalForwarding(cmdPath string, argv []string, env []string, workDir string) int {
 	cmd := exec.Command(cmdPath, argv[1:]...)
@@ -268,19 +302,21 @@ func runWithSignalForwarding(cmdPath string, argv []string, env []string, workDi
 		fatalf("failed to start child process: %v", err)
 	}
 
-	// GRUG: Forward interrupt signals to child process group.
+	// GRUG: forward interrupt and terminate signals to child.
+	// without this, Ctrl+C kills the wrapper but leaves the child running.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		for sig := range sigCh {
 			if cmd.Process != nil {
-				cmd.Process.Signal(sig)
+				cmd.Process.Signal(sig) //nolint:errcheck
 			}
 		}
 	}()
 
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
+			// GRUG: child exited nonzero. pass exit code through.
 			return exitErr.ExitCode()
 		}
 		fatalf("child process error: %v", err)
@@ -290,12 +326,10 @@ func runWithSignalForwarding(cmdPath string, argv []string, env []string, workDi
 }
 
 // resolveExtractDir determines where to extract the packed directory.
-// Returns (dir, cleanupFn, error). cleanupFn is nil if no cleanup needed
-// (persist mode) or if the OS handles it (Unix syscall.Exec replaces us).
+// Returns (dir, cleanupFn, error). cleanupFn is nil if no cleanup is needed.
 func resolveExtractDir(binaryName string) (string, func(), error) {
-	// GRUG: For now, always use a fresh tmpdir. Persist mode is a future flag
-	// that will be read from the embedded config. This keeps the stub simple.
-	// The extracted dir is named after the binary for easy identification.
+	// GRUG: always use fresh tmpdir for now. persist mode = future work.
+	// tmpdir named after binary so `ls /tmp` is readable.
 	dir, err := os.MkdirTemp("", "bindboss-"+binaryName+"-*")
 	if err != nil {
 		return "", nil, fmt.Errorf(
@@ -303,6 +337,7 @@ func resolveExtractDir(binaryName string) (string, func(), error) {
 	}
 
 	cleanup := func() {
+		// GRUG: remove whole tmpdir on exit. not on exec path — stub is gone.
 		os.RemoveAll(dir)
 	}
 
@@ -310,7 +345,7 @@ func resolveExtractDir(binaryName string) (string, func(), error) {
 }
 
 // splitCmd splits a shell-style command string into argv tokens.
-// Handles single and double quoted strings. No shell expansion.
+// Handles single and double quoted strings. No shell expansion or escaping.
 func splitCmd(s string) []string {
 	s = strings.TrimSpace(s)
 	if s == "" {

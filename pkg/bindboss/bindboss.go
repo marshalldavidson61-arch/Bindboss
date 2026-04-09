@@ -1,17 +1,18 @@
 // bindboss.go
 // =============================================================================
-// GRUG: This is the library cave. Exposes bindboss as an importable Go package
-// so Bun/Julia build tools and other Go programs can call it programmatically
-// without shelling out to the CLI.
+// GRUG: This is the library cave. Other Go programs can import bindboss and
+// call Pack/Inspect/Verify without shelling out to the CLI. No os.Args.
+// No flag.Parse. No os.Exit. Just functions that return errors like a
+// civilized Go library.
 //
-// ACADEMIC: The library API is a thin, typed wrapper over the internal packages.
-// It avoids os.Exit and flag parsing entirely — those belong to the CLI layer.
-// All errors are returned as values. Callers decide what to do with them.
+// If you are writing a build tool in Go (Bun plugin, Julia build script
+// wrapper, CI system) and want to pack binaries programmatically — use this.
+// If you just want to run `bindboss pack` from a terminal — use the CLI.
 //
-// Import path: github.com/marshalldavidson61-arch/bindboss/pkg/bindboss
+// Import path:
+//   github.com/marshalldavidson61-arch/bindboss/pkg/bindboss
 //
-// Minimal example:
-//
+// Quick example:
 //   import bb "github.com/marshalldavidson61-arch/bindboss/pkg/bindboss"
 //
 //   err := bb.Pack(bb.PackOptions{
@@ -24,6 +25,38 @@
 //           URL:   "https://julialang.org/downloads/",
 //       }},
 //   })
+//
+// All exported functions return non-nil error on failure. No panics.
+// No side effects other than filesystem writes (the output binary).
+// No global state.
+//
+// ---
+// ACADEMIC: The library API is a typed, minimal facade over the internal
+// packages. Its design follows three principles:
+//
+//   1. No process lifecycle coupling:
+//      Internal packages call fmt.Fprintf(os.Stderr) for logging but never
+//      call os.Exit(). The library layer inherits this — callers retain full
+//      control over process lifetime.
+//
+//   2. Type isomorphism with config.Config:
+//      bb.Dep, bb.Hooks, and bb.PackOptions map 1:1 to config.Dep,
+//      config.Hooks, and config.Config. The library re-exports these as
+//      public types so callers do not need to import internal packages
+//      (which are intentionally unexported by module convention).
+//
+//   3. Helper duplication over abstraction leakage:
+//      compileStub, parseTarget, findModuleRoot, and copyDir are duplicated
+//      from cmd/pack.go rather than shared via an internal helper package.
+//      This keeps the cmd/ and pkg/ layers independently compilable and
+//      avoids coupling the library's API surface to CLI implementation
+//      details. The duplication is ~100 lines and changes rarely.
+//
+// Pack pipeline summary (same as CLI):
+//   Stage 1: Compile stub binary (go build -tags stub, CGO_ENABLED=0)
+//   Stage 2: Stage source dir + inject bindboss.toml
+//   Stage 3: AppendPayload = tar.gz + 121-byte v2 trailer
+//            (tar_offset || SHA-256 || Ed25519_or_zeros || flags || magic)
 // =============================================================================
 
 package bindboss
@@ -58,7 +91,7 @@ type Hooks struct {
 }
 
 // PackOptions holds all parameters for a Pack call.
-// All fields except SrcDir, OutPath, and Run have safe zero values.
+// SrcDir, OutPath, and Run are required. All other fields have safe zero values.
 type PackOptions struct {
 	// SrcDir is the directory to pack. Required.
 	SrcDir string
@@ -70,13 +103,13 @@ type PackOptions struct {
 	// Example: "julia main.jl"
 	Run string
 
-	// ExecMode: "exec" (default) or "fork". See config.Config.ExecMode.
+	// ExecMode: "exec" (default) or "fork". See stub.go for exec model details.
 	ExecMode string
 
 	// Needs lists runtime dependencies to check on first run.
 	Needs []Dep
 
-	// Env lists extra environment variables for the run command.
+	// Env lists extra environment variables injected before the run command.
 	// Format: "KEY=value"
 	Env []string
 
@@ -86,7 +119,7 @@ type PackOptions struct {
 	// Persist: if true, extract to a fixed directory and reuse on subsequent runs.
 	Persist bool
 
-	// ExtractDir overrides the extract root directory.
+	// ExtractDir overrides the extract root directory. Empty = use tmpdir.
 	ExtractDir string
 
 	// Target is the cross-compile target as "GOOS/GOARCH".
@@ -94,13 +127,13 @@ type PackOptions struct {
 	Target string
 
 	// PrivKey is an optional Ed25519 private key for signing the payload.
-	// nil = no signature.
+	// nil = pack without signature (hash still stored in v2 trailer).
 	PrivKey ed25519.PrivateKey
 }
 
 // Info describes the contents of a packed binary, returned by Inspect.
 type Info struct {
-	// Name is the binary name from config.
+	// Name is the binary name from embedded config.
 	Name string
 
 	// Run is the run command embedded in the binary.
@@ -118,21 +151,21 @@ type Info struct {
 	// Hooks is the pre/post run hook configuration.
 	Hooks Hooks
 
-	// Hash is the SHA-256 of the payload bytes (hex string).
-	// Empty if the binary is v1 (no hash stored).
+	// Hash is the SHA-256 of the payload bytes as a hex string.
+	// Empty if the binary is v1 format (no hash stored).
 	Hash string
 
-	// HashPresent is true if a hash is stored in the trailer.
+	// HashPresent is true if a hash is stored in the v2 trailer.
 	HashPresent bool
 
-	// SigPresent is true if an Ed25519 signature is stored in the trailer.
+	// SigPresent is true if an Ed25519 signature is stored in the v2 trailer.
 	SigPresent bool
 
-	// V1 is true if this binary uses the legacy v1 trailer format.
+	// V1 is true if this binary uses the legacy v1 trailer format (no hash/sig).
 	V1 bool
 }
 
-// Pack compiles a stub, packs the directory, and writes the output binary.
+// Pack compiles a stub, stages the source directory, and writes the output binary.
 // This is the programmatic equivalent of `bindboss pack`.
 // Returns a non-nil error on any failure — no silent partial output.
 func Pack(opts PackOptions) error {
@@ -146,7 +179,7 @@ func Pack(opts PackOptions) error {
 		return fmt.Errorf("!!! FATAL: Pack: Run command is required")
 	}
 
-	// GRUG: Validate source directory exists and is a directory.
+	// GRUG: validate source dir exists and is actually a directory.
 	info, err := os.Stat(opts.SrcDir)
 	if err != nil {
 		return fmt.Errorf("!!! FATAL: Pack: source directory %q: %w", opts.SrcDir, err)
@@ -183,7 +216,7 @@ func Pack(opts PackOptions) error {
 		return err
 	}
 
-	// Stage source dir with injected bindboss.toml
+	// GRUG: stage source dir + inject bindboss.toml. never modify originals.
 	tmpSrc, err := os.MkdirTemp("", "bindboss-pack-src-*")
 	if err != nil {
 		return fmt.Errorf("!!! FATAL: Pack: cannot create temp staging dir: %w", err)
@@ -202,7 +235,7 @@ func Pack(opts PackOptions) error {
 		return fmt.Errorf("!!! FATAL: Pack: cannot write bindboss.toml to staging dir: %w", err)
 	}
 
-	// Compile stub
+	// Compile stub for target platform
 	goos, goarch, err := parseTarget(opts.Target)
 	if err != nil {
 		return err
@@ -210,6 +243,7 @@ func Pack(opts PackOptions) error {
 
 	outPath := opts.OutPath
 	if goos == "windows" && !strings.HasSuffix(outPath, ".exe") {
+		// GRUG: windows needs .exe. add it automatically.
 		outPath += ".exe"
 	}
 
@@ -217,12 +251,12 @@ func Pack(opts PackOptions) error {
 		return err
 	}
 
-	// Append payload
+	// Append payload (tar.gz + v2 trailer with hash + optional sig)
 	return archive.AppendPayload(outPath, tmpSrc, opts.PrivKey)
 }
 
 // Inspect reads a packed binary and returns its embedded configuration and
-// trailer metadata. Does not extract or execute anything.
+// trailer metadata. Does not extract permanently or execute anything.
 // Returns a non-nil error if the binary is not a valid bindboss binary.
 func Inspect(binPath string) (*Info, error) {
 	payloadInfo, err := archive.FindPayload(binPath)
@@ -231,7 +265,8 @@ func Inspect(binPath string) (*Info, error) {
 	}
 	defer payloadInfo.Reader.Close()
 
-	// GRUG: Extract to a temp dir just to read bindboss.toml, then clean up.
+	// GRUG: extract to temp dir just to read bindboss.toml, then clean up.
+	// nothing persists from an Inspect call.
 	tmpDir, err := os.MkdirTemp("", "bindboss-inspect-*")
 	if err != nil {
 		return nil, fmt.Errorf("!!! FATAL: Inspect: cannot create temp dir: %w", err)
@@ -259,6 +294,7 @@ func Inspect(binPath string) (*Info, error) {
 
 	hashHex := ""
 	if payloadInfo.HashPresent {
+		// GRUG: format as hex string so callers can display or compare easily.
 		hashHex = fmt.Sprintf("%x", payloadInfo.Hash)
 	}
 
@@ -280,6 +316,7 @@ func Inspect(binPath string) (*Info, error) {
 // verifies the Ed25519 signature. Returns nil on success, error on failure.
 // Equivalent to `bindboss verify` (with optional --pubkey).
 func Verify(binPath string, pubKey ed25519.PublicKey) error {
+	// GRUG: always check hash. sig check only if caller provides a key.
 	if err := archive.VerifyHash(binPath); err != nil {
 		return err
 	}
@@ -290,7 +327,7 @@ func Verify(binPath string, pubKey ed25519.PublicKey) error {
 }
 
 // GenerateKey creates a new Ed25519 keypair and saves it to keyDir/<name>.key
-// and keyDir/<name>.pub. Returns the private key for immediate use.
+// and keyDir/<name>.pub. Returns the private and public keys for immediate use.
 // If keyDir is empty, uses the default (~/.bindboss/keys/).
 func GenerateKey(keyDir, name string) (ed25519.PrivateKey, ed25519.PublicKey, error) {
 	if keyDir == "" {
@@ -318,7 +355,8 @@ func LoadPublicKey(path string) (ed25519.PublicKey, error) {
 }
 
 // -----------------------------------------------------------------------------
-// Internal helpers (mirror of cmd/pack.go — kept in sync)
+// Internal helpers — mirror of cmd/pack.go, kept in sync manually.
+// GRUG: duplication is intentional. see academic header for rationale.
 // -----------------------------------------------------------------------------
 
 func compileStub(outPath, goos, goarch string) error {
@@ -336,7 +374,7 @@ func compileStub(outPath, goos, goarch string) error {
 	cmd.Env = append(os.Environ(),
 		"GOOS="+goos,
 		"GOARCH="+goarch,
-		"CGO_ENABLED=0",
+		"CGO_ENABLED=0", // GRUG: static binary. no libc. works on any kernel.
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -359,6 +397,7 @@ func parseTarget(target string) (goos, goarch string, err error) {
 }
 
 func findModuleRoot() (string, error) {
+	// GRUG: try executable dir first (installed), then cwd (go run / dev).
 	self, err := os.Executable()
 	if err == nil {
 		self, _ = filepath.EvalSymlinks(self)

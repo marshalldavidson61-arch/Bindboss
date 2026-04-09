@@ -1,23 +1,58 @@
 // pack.go
 // =============================================================================
-// GRUG: The pack command. Takes a directory and a binary name, compiles the
-// stub for the target platform, appends the directory as a tar.gz payload,
-// and writes the output binary. One command, done.
+// GRUG: The pack command. Grug give it a directory and an output name.
+// Grug get back one binary that runs everywhere, no install needed.
+// That is the whole deal. One command. One binary. Done.
 //
-// ACADEMIC: The packing pipeline has three stages:
-//   1. Compile the stub binary for the target platform (go build with GOOS/GOARCH).
-//   2. Write the stub binary to the output path.
-//   3. Append the packed directory + trailer to the output binary.
-// The config (bindboss.toml or CLI flags) is written into the directory before
-// archiving, so the stub finds it on extraction.
+// What happens inside:
+//   1. Load bindboss.toml from source dir (if exists), merge with CLI flags
+//   2. Copy source dir to a temp staging dir so originals stay untouched
+//   3. Write merged config as bindboss.toml into the staging dir
+//   4. Compile the stub binary for target platform (go build -tags stub)
+//   5. Append staged dir as tar.gz + v2 trailer to the stub binary
 //
-// v2 trailer: hash is always computed and stored. --sign=<keyfile> adds an
-// Ed25519 signature over the payload hash for integrity invariant enforcement.
+// --run is required unless bindboss.toml already has a run field.
+// --needs can be repeated for multiple deps.
+// --sign adds an Ed25519 signature over the payload hash. Optional.
+// --target lets grug cross-compile: --target=linux/amd64, darwin/arm64, etc.
+//
+// GRUG RULE: run command must be set. no run = no point. fatal error.
+// GRUG RULE: source must be a directory. not a file. not a URL. a directory.
+//
+// ---
+// ACADEMIC: The packing pipeline is a three-stage append-only construction:
+//
+//   Stage 1 — Stub compilation:
+//     `go build -tags stub -o <output> ./stub` produces a statically linked
+//     ELF/PE/Mach-O binary containing only the stub runtime. CGO_ENABLED=0
+//     ensures portability — no libc dependency, runs on any kernel ABI version
+//     for the target GOOS/GOARCH.
+//
+//   Stage 2 — Staging:
+//     The source directory is copied into a temp dir and bindboss.toml is
+//     injected with the merged configuration. This preserves the source tree
+//     and ensures the stub finds a canonical config on extraction.
+//
+//   Stage 3 — Payload append (archive.AppendPayload):
+//     The staged directory is compressed as tar.gz and appended to the stub
+//     binary. A 121-byte v2 trailer is appended after the tar.gz:
+//       [8b big-endian tar offset][32b SHA-256][64b Ed25519 or zeros][1b flags][16b magic]
+//     SHA-256 is computed over the raw tar.gz bytes. If --sign is provided,
+//     Ed25519 is computed over SHA-256(payload) — signing a hash rather than
+//     raw bytes is safe when the hash function is collision-resistant (SHA-256
+//     provides 128-bit collision resistance, well above the 80-bit threshold
+//     for Ed25519 security).
+//
+//   Cross-compilation: GOOS and GOARCH are injected as environment variables
+//   into the `go build` subprocess. The Go toolchain handles the rest.
+//   The stub uses only syscall-level primitives (os, syscall, archive/tar,
+//   compress/gzip) with no CGO, making cross-compilation reliable.
 // =============================================================================
 
 package cmd
 
 import (
+	"crypto/ed25519"
 	"flag"
 	"fmt"
 	"os"
@@ -25,8 +60,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-
-	"crypto/ed25519"
 
 	"github.com/marshalldavidson61-arch/bindboss/internal/archive"
 	"github.com/marshalldavidson61-arch/bindboss/internal/config"
@@ -71,8 +104,9 @@ func (c *PackCmd) Usage() string {
 }
 
 func (c *PackCmd) Run(args []string) error {
-	// GRUG: Go flag stops at first non-flag arg. Support any interleaving of
-	// positionals and flags by separating them before parsing.
+	// GRUG: Go flag.Parse stops at first non-flag arg. user might write:
+	// "pack ./dir out --run=..." OR "pack --run=... ./dir out"
+	// separate positionals from flags before parsing so both orderings work.
 	var positionals, flagArgs []string
 	for _, a := range args {
 		if len(a) > 0 && a[0] == '-' {
@@ -101,6 +135,7 @@ func (c *PackCmd) Run(args []string) error {
 		return fmt.Errorf("!!! FATAL: source directory %q: %w", srcDir, err)
 	}
 	if !info.IsDir() {
+		// GRUG: not a directory = stop immediately. no partial packs.
 		return fmt.Errorf("!!! FATAL: %q is not a directory", srcDir)
 	}
 
@@ -112,7 +147,7 @@ func (c *PackCmd) Run(args []string) error {
 		return err
 	}
 
-	// GRUG: Binary name = basename of output path, used in state files and logs.
+	// GRUG: binary name = basename of output path. used in state files and logs.
 	binaryName := filepath.Base(outPath)
 	needsSlice := []string(c.needs)
 	cfg, err = config.MergeFlags(cfg, binaryName, c.run, needsSlice, c.persist, c.dir)
@@ -120,7 +155,7 @@ func (c *PackCmd) Run(args []string) error {
 		return err
 	}
 
-	// GRUG: Run command must be set either in toml or via --run flag.
+	// GRUG: validate after merge. run command must be set by now.
 	if err := config.Validate(cfg); err != nil {
 		return err
 	}
@@ -138,9 +173,8 @@ func (c *PackCmd) Run(args []string) error {
 	}
 
 	// ------------------------------------------------------------------
-	// Write merged config into source dir as bindboss.toml
-	// GRUG: We write the config INTO a temp copy of the source dir so the
-	// original directory is not modified. The stub reads it on extraction.
+	// Stage source dir
+	// GRUG: copy into temp dir, inject bindboss.toml. never modify originals.
 	// ------------------------------------------------------------------
 	tmpSrc, err := os.MkdirTemp("", "bindboss-pack-src-*")
 	if err != nil {
@@ -148,7 +182,6 @@ func (c *PackCmd) Run(args []string) error {
 	}
 	defer os.RemoveAll(tmpSrc)
 
-	// GRUG: Copy source dir into tmpSrc so we can inject bindboss.toml.
 	if err := copyDir(srcDir, tmpSrc); err != nil {
 		return fmt.Errorf("!!! FATAL: cannot copy source directory for staging: %w", err)
 	}
@@ -173,6 +206,7 @@ func (c *PackCmd) Run(args []string) error {
 	fmt.Printf("[bindboss] compiling stub for %s/%s...\n", goos, goarch)
 	stubPath := outPath
 	if goos == "windows" && !strings.HasSuffix(stubPath, ".exe") {
+		// GRUG: windows binary needs .exe suffix or it won't run.
 		stubPath += ".exe"
 		outPath = stubPath
 	}
@@ -182,14 +216,14 @@ func (c *PackCmd) Run(args []string) error {
 	}
 
 	// ------------------------------------------------------------------
-	// Append payload to stub (with hash + optional sig)
+	// Append payload to stub
 	// ------------------------------------------------------------------
 	fmt.Printf("[bindboss] packing %s into %s...\n", srcDir, outPath)
 	if err := archive.AppendPayload(outPath, tmpSrc, privKey); err != nil {
 		return err
 	}
 
-	// GRUG: Print final size so the user knows what they're shipping.
+	// GRUG: print size so user knows what they are shipping to someone.
 	fi, _ := os.Stat(outPath)
 	sizeMB := float64(0)
 	if fi != nil {
@@ -219,9 +253,10 @@ func (c *PackCmd) Run(args []string) error {
 }
 
 // compileStub compiles the stub binary to outPath for the given GOOS/GOARCH.
-// Uses `go build` with the "stub" build tag so only stub.go is compiled.
+// Uses `go build -tags stub` so only stub.go (build tag "stub") is compiled.
 func compileStub(outPath, goos, goarch string) error {
-	// GRUG: Find the module root so we can tell go build where the stub package is.
+	// GRUG: find module root so we know where the stub package lives.
+	// bindboss may be run from any directory, not just its source root.
 	moduleRoot, err := findModuleRoot()
 	if err != nil {
 		return fmt.Errorf("!!! FATAL: cannot find bindboss module root: %w", err)
@@ -237,7 +272,7 @@ func compileStub(outPath, goos, goarch string) error {
 	cmd.Env = append(os.Environ(),
 		"GOOS="+goos,
 		"GOARCH="+goarch,
-		"CGO_ENABLED=0", // GRUG: Static binary. No libc dependency.
+		"CGO_ENABLED=0", // GRUG: static binary. no libc. runs on any kernel.
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -251,6 +286,7 @@ func compileStub(outPath, goos, goarch string) error {
 // parseTarget splits a "GOOS/GOARCH" string. Empty target = current platform.
 func parseTarget(target string) (goos, goarch string, err error) {
 	if target == "" {
+		// GRUG: no target = pack for right now, right here.
 		return runtime.GOOS, runtime.GOARCH, nil
 	}
 	parts := strings.SplitN(target, "/", 2)
@@ -262,8 +298,9 @@ func parseTarget(target string) (goos, goarch string, err error) {
 }
 
 // findModuleRoot walks up from the current directory to find go.mod.
+// Tries the directory of the bindboss executable first, then cwd.
 func findModuleRoot() (string, error) {
-	// GRUG: First try the directory of the bindboss executable itself.
+	// GRUG: try from the executable's dir first. most reliable when installed.
 	self, err := os.Executable()
 	if err == nil {
 		self, _ = filepath.EvalSymlinks(self)
@@ -280,7 +317,7 @@ func findModuleRoot() (string, error) {
 		}
 	}
 
-	// GRUG: Try the current working directory and its parents.
+	// GRUG: fall back to cwd walk. works when running `go run .` from source.
 	cwd, err := os.Getwd()
 	if err != nil {
 		return "", fmt.Errorf("cannot get cwd: %w", err)
@@ -301,7 +338,7 @@ func findModuleRoot() (string, error) {
 }
 
 // copyDir recursively copies srcDir into destDir.
-// destDir must already exist. Files are copied with their original permissions.
+// destDir must already exist. Files are copied with original permissions.
 func copyDir(srcDir, destDir string) error {
 	return filepath.Walk(srcDir, func(path string, fi os.FileInfo, walkErr error) error {
 		if walkErr != nil {

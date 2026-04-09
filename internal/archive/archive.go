@@ -1,29 +1,45 @@
 // archive.go
 // =============================================================================
-// GRUG: This is the archive cave. Packs a directory into a gzip-compressed tar
-// stream. The stream gets appended to the stub binary, making it self-extracting.
-// On the other end, Extract() reads that stream back out and restores the tree.
+// GRUG: grug pack directory into one blob. blob go at end of binary.
+// binary run, binary find blob at end, binary pull out files, binary run command.
+// grug not need install. grug not need package manager. grug just run file.
 //
-// ACADEMIC: The self-extracting binary pattern works by appending a payload
-// to a valid ELF/Mach-O/PE binary. The OS executes the binary normally (the
-// loader only reads the ELF headers, which are at the front). The binary then
-// seeks to a known offset near its own EOF to find the payload boundary marker,
-// reads the tar stream from that point, and extracts it.
+// GRUG: blob has magic number at very end so grug can find it fast.
+// grug seek to end of file, read 121 bytes, check magic. if magic wrong,
+// not a bindboss binary. FATAL. no silent fail ever.
 //
-// Trailer format (v2, 121 bytes):
+// GRUG: new binary (v2) also store hash of blob. if someone mess with blob,
+// hash not match. FATAL. old binary (v1) still work but grug warn you.
 //
-//   [tar.gz data ...] [8b: tar offset BE] [32b: SHA-256 of tar bytes]
-//   [64b: Ed25519 signature OR zeros] [1b: flags] [16b: magic v2]
+// GRUG: signing optional. if you give key, grug sign hash with Ed25519.
+// now even if attacker swap payload, signature break. caught.
 //
-// Flags byte:
-//   bit 0 = hash present (always 1 in v2)
-//   bit 1 = Ed25519 signature present
+// -----------------------------------------------------------------------------
+// ACADEMIC FOOTER:
+// The self-extracting binary pattern appends a gzip-compressed tar archive to
+// a valid ELF/Mach-O/PE executable. The OS loader reads only the ELF headers
+// at the binary's front; the appended payload is invisible to it. The stub
+// then locates the payload via a fixed-size trailer at EOF.
 //
-// Magic v2 differs from v1 so old stubs fail loudly on new binaries (correct).
-// New stubs detect v1 magic and handle it gracefully (no hash/sig, run anyway).
+// Trailer layout (v2, 121 bytes):
+//   [tar.gz bytes ...][8b offset BE][32b SHA-256][64b Ed25519 or zeros][1b flags][16b magic]
 //
-// v1 trailer (legacy, read-only support): 24 bytes
-//   [tar.gz data ...] [8b: tar offset BE] [16b: magic v1]
+// The 8-byte offset is a big-endian uint64 recording where the tar.gz data
+// begins (= original stub size). This gives O(1) payload location with no
+// scanning. SHA-256 covers the raw compressed bytes. Ed25519 signs the hash
+// (not the raw payload), which is safe for collision-resistant hash functions
+// and avoids loading the full payload for signing.
+//
+// Flags byte: bit 0 = hash present (always 1 in v2), bit 1 = sig present.
+//
+// v1 trailer (24 bytes, legacy): [8b offset][16b magic v1]. Detected at
+// runtime; new stub reads it gracefully, warns, and runs. v1 magic differs
+// from v2 magic so old stubs FATAL loudly on new binaries — correct behavior.
+//
+// HashDir uses a canonical sorted traversal (lexicographic by relative path)
+// feeding SHA-256 as: Write(relpath+"\x00") then Write(file_contents) per
+// entry. Metadata (mtime, inode, permissions) is intentionally excluded so
+// two directories with identical content hash identically.
 // =============================================================================
 
 package archive
@@ -43,74 +59,47 @@ import (
 	"strings"
 )
 
-// MagicV1 is the legacy 16-byte boundary marker (read-only support).
+// MagicV1 is the legacy 16-byte trailer marker. Read-only — grug no longer writes this.
 var MagicV1 = [16]byte{
 	0xBB, 0x05, 0x5B, 0x0B, 0x1C, 0xEB, 0x05, 0x5B,
 	0x0D, 0xEA, 0xDB, 0x0B, 0xBB, 0x0B, 0x05, 0x5B,
 }
 
-// MagicV2 is the v2 16-byte boundary marker.
-// Differs from v1 at bytes [0] (0xBD vs 0xBB) and [15] (0x5C vs 0x5B),
-// so v1 stubs FATAL loudly on v2 binaries rather than silently misreading.
+// MagicV2 is the current 16-byte trailer marker.
+// Byte [0] and [15] differ from v1 — old stubs see wrong magic and FATAL loudly.
 var MagicV2 = [16]byte{
 	0xBD, 0x05, 0x5B, 0x0B, 0x1C, 0xEB, 0x05, 0x5C,
 	0x0D, 0xEA, 0xDB, 0x0B, 0xBB, 0x0B, 0x05, 0x5C,
 }
 
-// Magic is the current write magic (v2). Alias so call sites don't need
-// version awareness when packing.
+// Magic is what grug writes. Always v2.
 var Magic = MagicV2
 
-// Trailer layout constants.
 const (
-	// TrailerV1Size: 8b offset + 16b magic = 24 bytes (legacy).
-	TrailerV1Size = 24
+	TrailerV1Size = 24  // v1: 8b offset + 16b magic
+	TrailerV2Size = 121 // v2: 8b offset + 32b hash + 64b sig + 1b flags + 16b magic
 
-	// TrailerV2Size: 8b offset + 32b hash + 64b sig + 1b flags + 16b magic = 121 bytes.
-	// ACADEMIC: Ed25519 signatures are exactly 64 bytes. SHA-256 hashes are 32 bytes.
-	// The flags byte records which optional fields are meaningful vs zero-filled.
-	TrailerV2Size = 121
-
-	// FlagHashPresent: bit 0 of flags — SHA-256 hash is valid (always set in v2).
-	FlagHashPresent byte = 1 << 0
-
-	// FlagSigPresent: bit 1 of flags — Ed25519 signature is valid.
-	FlagSigPresent byte = 1 << 1
+	FlagHashPresent byte = 1 << 0 // bit 0: SHA-256 stored (always 1 in v2)
+	FlagSigPresent  byte = 1 << 1 // bit 1: Ed25519 signature stored
 )
 
-// TrailerSize is the size written by AppendPayload (always v2).
+// TrailerSize is what grug writes today.
 const TrailerSize = TrailerV2Size
 
-// PayloadInfo is returned by FindPayload and carries the hash and sig
-// alongside the reader, so callers (inspect, verify, stub) can use them
-// without re-reading the file.
+// PayloadInfo is what FindPayload hands back.
+// Carry it around — it has the reader AND the hash AND sig status.
 type PayloadInfo struct {
-	// Reader is positioned at the start of the tar.gz payload.
-	// Caller must Close() it.
-	Reader io.ReadCloser
-
-	// Hash is the SHA-256 of the raw tar.gz bytes (not the extracted content).
-	// Zero-value if HashPresent is false (v1 binary).
-	Hash [32]byte
-
-	// Sig is the Ed25519 signature over Hash. Zero-value if SigPresent is false.
-	Sig [64]byte
-
-	// HashPresent is true if this is a v2 binary with a stored hash.
-	HashPresent bool
-
-	// SigPresent is true if this binary was packed with --sign.
-	SigPresent bool
-
-	// V1 is true if this binary uses the legacy v1 trailer format.
-	// Provided for graceful degradation — no hash or sig available.
-	V1 bool
+	Reader      io.ReadCloser // positioned at start of tar.gz — caller must Close()
+	Hash        [32]byte      // SHA-256 of tar.gz bytes. zero if V1
+	Sig         [64]byte      // Ed25519 sig over Hash. zero if not signed
+	HashPresent bool          // true for v2 binaries
+	SigPresent  bool          // true if packed with --sign
+	V1          bool          // true for legacy binaries — no hash, no sig
 }
 
-// Pack walks srcDir and writes all files as a gzip-compressed tar stream to w.
-// Paths in the archive are relative to srcDir (no leading slash, no srcDir prefix).
-// Symlinks are followed. Empty directories are included as directory entries.
-// Returns an error if any file cannot be read — no silent partial archives.
+// Pack walks srcDir and writes everything as gzip tar into w.
+// Paths inside archive are relative to srcDir. No srcDir prefix. No leading slash.
+// Empty dirs included. Symlinks followed. Any read error = FATAL. No partial archives.
 func Pack(srcDir string, w io.Writer) error {
 	srcDir = filepath.Clean(srcDir)
 
@@ -130,16 +119,13 @@ func Pack(srcDir string, w io.Writer) error {
 			return fmt.Errorf("!!! FATAL: walk error at %q: %w", path, walkErr)
 		}
 
-		// GRUG: Compute the archive-relative path. Strip srcDir prefix and
-		// normalize to forward slashes so archives are cross-platform.
 		rel, err := filepath.Rel(srcDir, path)
 		if err != nil {
 			return fmt.Errorf("!!! FATAL: cannot compute relative path for %q: %w", path, err)
 		}
 		rel = filepath.ToSlash(rel)
 
-		// GRUG: Skip the root "." entry — it would extract as an empty dir entry
-		// at the root and confuse the extractor.
+		// GRUG: skip root "." — would make empty dir entry at root, confuse extractor
 		if rel == "." {
 			return nil
 		}
@@ -154,8 +140,7 @@ func Pack(srcDir string, w io.Writer) error {
 			return fmt.Errorf("!!! FATAL: cannot write tar header for %q: %w", rel, err)
 		}
 
-		// GRUG: Only copy file contents for regular files.
-		// Directories and symlinks only need headers.
+		// GRUG: only copy bytes for real files. dirs and symlinks just need header.
 		if fi.Mode().IsRegular() {
 			f, err := os.Open(path)
 			if err != nil {
@@ -170,7 +155,6 @@ func Pack(srcDir string, w io.Writer) error {
 
 		return nil
 	})
-
 	if err != nil {
 		return err
 	}
@@ -185,10 +169,8 @@ func Pack(srcDir string, w io.Writer) error {
 	return nil
 }
 
-// Extract reads a gzip-compressed tar stream from r and writes all entries
-// under destDir. Paths are sanitized to prevent directory traversal attacks
-// (no "../" escapes, no absolute paths in archive entries).
-// Returns an error if any entry cannot be extracted.
+// Extract pulls a gzip tar stream from r and writes files under destDir.
+// Sanitizes paths — no "../" escapes, no absolute paths. Any bad path = FATAL.
 func Extract(r io.Reader, destDir string) error {
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return fmt.Errorf("!!! FATAL: cannot create extract dir %q: %w", destDir, err)
@@ -211,7 +193,7 @@ func Extract(r io.Reader, destDir string) error {
 			return fmt.Errorf("!!! FATAL: corrupt tar stream: %w", err)
 		}
 
-		// GRUG: Sanitize path. Archive entries must not escape destDir.
+		// GRUG: bad path = attacker tries to escape destDir. kill it.
 		clean := filepath.Clean(hdr.Name)
 		if strings.HasPrefix(clean, "..") || filepath.IsAbs(clean) {
 			return fmt.Errorf(
@@ -227,8 +209,7 @@ func Extract(r io.Reader, destDir string) error {
 			}
 
 		case tar.TypeReg, tar.TypeRegA:
-			// GRUG: Ensure parent directory exists before writing the file.
-			// Tar files don't guarantee directory entries appear before their children.
+			// GRUG: tar does not guarantee dir entries before child files. make parent anyway.
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return fmt.Errorf("!!! FATAL: cannot create parent for %q: %w", target, err)
 			}
@@ -245,9 +226,8 @@ func Extract(r io.Reader, destDir string) error {
 			f.Close()
 
 		default:
-			// GRUG: Skip unknown entry types (symlinks etc.) with a warning.
-			// We don't FATAL here because a missing symlink rarely breaks things,
-			// but we don't silently swallow it either.
+			// GRUG: unknown type (symlinks etc) — skip with warning, not FATAL.
+			// missing symlink rarely breaks things. silent skip is still wrong so we warn.
 			fmt.Fprintf(os.Stderr, "[bindboss] warning: skipping archive entry %q (type %d)\n",
 				hdr.Name, hdr.Typeflag)
 		}
@@ -256,21 +236,12 @@ func Extract(r io.Reader, destDir string) error {
 	return nil
 }
 
-// HashDir computes a deterministic SHA-256 digest of a directory tree.
-//
-// ACADEMIC: Determinism requires a canonical traversal order. We sort all
-// file paths lexicographically, then hash each file as:
-//
-//	SHA-256.Write([]byte(rel_path + "\x00"))
-//	SHA-256.Write(file_contents)
-//
-// Directory entries contribute only their path (no contents). This means
-// two directories with identical files produce identical hashes regardless
-// of filesystem ordering or metadata (mtime, inode, etc.).
+// HashDir computes a deterministic SHA-256 of a whole directory tree.
+// Same files + same names = same hash, always, regardless of filesystem order.
 func HashDir(dir string) ([32]byte, error) {
 	type entry struct {
-		rel  string
-		path string
+		rel   string
+		path  string
 		isDir bool
 	}
 
@@ -294,14 +265,14 @@ func HashDir(dir string) ([32]byte, error) {
 		return [32]byte{}, err
 	}
 
-	// GRUG: Sort by relative path for canonical order.
+	// GRUG: sort by path so hash is same no matter what order filesystem returns files
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].rel < entries[j].rel
 	})
 
 	h := sha256.New()
 	for _, e := range entries {
-		// GRUG: Hash the path first (null-terminated for unambiguous framing).
+		// GRUG: null byte after path = unambiguous framing. no two paths can collide.
 		h.Write([]byte(e.rel + "\x00"))
 		if !e.isDir {
 			data, err := os.ReadFile(e.path)
@@ -317,46 +288,31 @@ func HashDir(dir string) ([32]byte, error) {
 	return out, nil
 }
 
-// AppendPayload appends a packed archive to an existing binary file at binPath.
-//
-// The layout written is:
-//
-//	[existing binary] [tar.gz data] [8b: offset] [32b: SHA-256] [64b: sig or zeros]
-//	[1b: flags] [16b: magic v2]
-//
-// privKey may be nil (no signature). Pass an ed25519.PrivateKey to sign.
-// Returns an error on any failure — the original binary is never partially written.
+// AppendPayload writes stub + tar.gz + v2 trailer into binPath atomically.
+// privKey may be nil — grug skip signature, store zeros in sig field.
+// Original binary never touched if anything fails — temp file + rename.
 func AppendPayload(binPath string, srcDir string, privKey ed25519.PrivateKey) error {
-	// GRUG: Read the existing stub binary.
 	stub, err := os.ReadFile(binPath)
 	if err != nil {
 		return fmt.Errorf("!!! FATAL: cannot read stub binary %q: %w", binPath, err)
 	}
 
-	// GRUG: Write to a temp file first. If anything fails midway, the original
-	// binary is untouched. Atomically replace at the end.
+	// GRUG: write to temp file first. if crash midway, original binary still good.
 	tmp, err := os.CreateTemp(filepath.Dir(binPath), ".bindboss-pack-*")
 	if err != nil {
 		return fmt.Errorf("!!! FATAL: cannot create temp file for packing: %w", err)
 	}
 	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // GRUG: clean up temp if rename never happens
 
-	defer func() {
-		// GRUG: Clean up temp file if we exit before the atomic rename.
-		os.Remove(tmpPath)
-	}()
-
-	// Write stub binary
 	if _, err := tmp.Write(stub); err != nil {
 		tmp.Close()
 		return fmt.Errorf("!!! FATAL: cannot write stub to temp file: %w", err)
 	}
 
-	// Record where the tar.gz payload will start
 	tarOffset := int64(len(stub))
 
-	// GRUG: Tee the pack output through a hash so we can record the SHA-256
-	// of the raw compressed bytes without a second pass.
+	// GRUG: tee pack output through hasher — get hash without second pass over data
 	payloadHasher := sha256.New()
 	hw := &hashingWriter{w: tmp, h: payloadHasher}
 	if err := Pack(srcDir, hw); err != nil {
@@ -364,11 +320,10 @@ func AppendPayload(binPath string, srcDir string, privKey ed25519.PrivateKey) er
 		return err
 	}
 
-	// Compute SHA-256 of payload bytes
 	var payloadHash [32]byte
 	copy(payloadHash[:], payloadHasher.Sum(nil))
 
-	// Write 8-byte big-endian offset
+	// write 8-byte offset
 	var offsetBuf [8]byte
 	binary.BigEndian.PutUint64(offsetBuf[:], uint64(tarOffset))
 	if _, err := tmp.Write(offsetBuf[:]); err != nil {
@@ -376,20 +331,16 @@ func AppendPayload(binPath string, srcDir string, privKey ed25519.PrivateKey) er
 		return fmt.Errorf("!!! FATAL: cannot write payload offset: %w", err)
 	}
 
-	// Write 32-byte SHA-256 hash
+	// write 32-byte SHA-256
 	if _, err := tmp.Write(payloadHash[:]); err != nil {
 		tmp.Close()
 		return fmt.Errorf("!!! FATAL: cannot write payload hash: %w", err)
 	}
 
-	// Write 64-byte signature (or zeros)
+	// write 64-byte sig or zeros
 	var sig [64]byte
 	flags := FlagHashPresent
 	if privKey != nil {
-		// ACADEMIC: Ed25519 signs the hash, not the raw payload. This is correct:
-		// Sign(hash(message)) has the same security properties as Sign(message)
-		// for collision-resistant hash functions, and avoids loading the full
-		// payload into memory for signing.
 		rawSig := ed25519.Sign(privKey, payloadHash[:])
 		if len(rawSig) != 64 {
 			tmp.Close()
@@ -403,13 +354,13 @@ func AppendPayload(binPath string, srcDir string, privKey ed25519.PrivateKey) er
 		return fmt.Errorf("!!! FATAL: cannot write signature: %w", err)
 	}
 
-	// Write 1-byte flags
+	// write 1-byte flags
 	if _, err := tmp.Write([]byte{flags}); err != nil {
 		tmp.Close()
 		return fmt.Errorf("!!! FATAL: cannot write flags byte: %w", err)
 	}
 
-	// Write 16-byte magic v2 trailer
+	// write 16-byte magic
 	if _, err := tmp.Write(MagicV2[:]); err != nil {
 		tmp.Close()
 		return fmt.Errorf("!!! FATAL: cannot write magic trailer: %w", err)
@@ -419,12 +370,11 @@ func AppendPayload(binPath string, srcDir string, privKey ed25519.PrivateKey) er
 		return fmt.Errorf("!!! FATAL: cannot flush packed binary: %w", err)
 	}
 
-	// GRUG: Atomic rename — replaces binPath with the fully packed temp file.
+	// GRUG: atomic rename — binPath either fully replaced or untouched. no half-writes.
 	if err := os.Rename(tmpPath, binPath); err != nil {
 		return fmt.Errorf("!!! FATAL: cannot replace binary with packed version: %w", err)
 	}
 
-	// GRUG: Ensure output binary is executable.
 	if err := os.Chmod(binPath, 0755); err != nil {
 		return fmt.Errorf("!!! FATAL: cannot chmod packed binary: %w", err)
 	}
@@ -432,13 +382,9 @@ func AppendPayload(binPath string, srcDir string, privKey ed25519.PrivateKey) er
 	return nil
 }
 
-// FindPayload opens the binary at binPath, detects the trailer version,
-// verifies the magic, reads the tar.gz offset, and returns a PayloadInfo
-// with a reader positioned at the start of the tar.gz payload.
-// Caller must Close() info.Reader.
-//
-// Returns a non-nil error (not a nil reader) if the binary has no valid
-// payload — this means it was not packed by bindboss.
+// FindPayload opens binPath, sniffs trailer version, and returns PayloadInfo
+// with reader positioned at start of tar.gz. Caller must Close() reader.
+// Returns FATAL error — not nil reader — if binary has no bindboss payload.
 func FindPayload(binPath string) (*PayloadInfo, error) {
 	f, err := os.Open(binPath)
 	if err != nil {
@@ -451,8 +397,7 @@ func FindPayload(binPath string) (*PayloadInfo, error) {
 		return nil, fmt.Errorf("!!! FATAL: cannot stat binary %q: %w", binPath, err)
 	}
 
-	// GRUG: Try v2 trailer first (most common path). If magic doesn't match,
-	// fall back to v1. If neither matches, the binary is not ours.
+	// GRUG: try v2 first (normal path). fall back to v1. if both fail = not ours.
 	info, err := tryReadV2Trailer(f, fi.Size())
 	if err == nil {
 		return info, nil
@@ -472,12 +417,8 @@ func FindPayload(binPath string) (*PayloadInfo, error) {
 			"was this binary packed with 'bindboss pack'?", binPath)
 }
 
-// HashPayload re-reads the raw tar.gz bytes from the binary and returns their
-// SHA-256. Used by VerifyHash to detect tampering independently of the stored hash.
-//
-// ACADEMIC: We compare the re-computed hash against the stored hash in the
-// trailer. A mismatch indicates either corruption or deliberate tampering.
-// We recompute from first principles rather than trusting the stored value.
+// HashPayload re-reads the raw tar.gz bytes from the binary and returns their SHA-256.
+// Independent of the stored hash — used to detect tampering from first principles.
 func HashPayload(binPath string) ([32]byte, error) {
 	info, err := FindPayload(binPath)
 	if err != nil {
@@ -495,9 +436,8 @@ func HashPayload(binPath string) ([32]byte, error) {
 	return out, nil
 }
 
-// VerifyHash re-computes the payload hash and compares it to the stored hash.
-// Returns nil if they match, a descriptive error otherwise.
-// Returns an error if the binary is v1 (no stored hash to compare against).
+// VerifyHash re-computes payload hash and compares to stored value.
+// Returns FATAL error on mismatch. Returns FATAL if binary is v1 (no stored hash).
 func VerifyHash(binPath string) error {
 	f, err := os.Open(binPath)
 	if err != nil {
@@ -535,8 +475,8 @@ func VerifyHash(binPath string) error {
 	return nil
 }
 
-// VerifySig checks the Ed25519 signature in the binary against pubKey.
-// Returns nil if valid, error if invalid or if no signature is present.
+// VerifySig checks the Ed25519 signature against pubKey.
+// Returns FATAL if no sig present or if sig is invalid.
 func VerifySig(binPath string, pubKey ed25519.PublicKey) error {
 	f, err := os.Open(binPath)
 	if err != nil {
@@ -567,27 +507,22 @@ func VerifySig(binPath string, pubKey ed25519.PublicKey) error {
 }
 
 // -----------------------------------------------------------------------------
-// Internal helpers
+// internal helpers
 // -----------------------------------------------------------------------------
 
-// tryReadV2Trailer attempts to read a v2 trailer from f (size fileSize).
-// Returns a PayloadInfo with an open reader on success, error otherwise.
 func tryReadV2Trailer(f *os.File, fileSize int64) (*PayloadInfo, error) {
 	if fileSize < int64(TrailerV2Size) {
 		return nil, fmt.Errorf("file too small for v2 trailer")
 	}
-
 	if _, err := f.Seek(-int64(TrailerV2Size), io.SeekEnd); err != nil {
 		return nil, fmt.Errorf("seek failed: %w", err)
 	}
-
 	var trailer [TrailerV2Size]byte
 	if _, err := io.ReadFull(f, trailer[:]); err != nil {
 		return nil, fmt.Errorf("read failed: %w", err)
 	}
 
-	// Layout: [8b offset][32b hash][64b sig][1b flags][16b magic]
-	// Offsets: 0..8, 8..40, 40..104, 104, 105..121
+	// layout: [8b offset][32b hash][64b sig][1b flags][16b magic]
 	var gotMagic [16]byte
 	copy(gotMagic[:], trailer[105:121])
 	if gotMagic != MagicV2 {
@@ -605,7 +540,6 @@ func tryReadV2Trailer(f *os.File, fileSize int64) (*PayloadInfo, error) {
 	if payloadSize < 0 {
 		return nil, fmt.Errorf("!!! FATAL: v2 trailer offset %d produces negative payload size", tarOffset)
 	}
-
 	if _, err := f.Seek(tarOffset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("!!! FATAL: cannot seek to payload offset %d: %w", tarOffset, err)
 	}
@@ -620,16 +554,13 @@ func tryReadV2Trailer(f *os.File, fileSize int64) (*PayloadInfo, error) {
 	}, nil
 }
 
-// tryReadV1Trailer attempts to read the legacy v1 24-byte trailer.
 func tryReadV1Trailer(f *os.File, fileSize int64) (*PayloadInfo, error) {
 	if fileSize < int64(TrailerV1Size) {
 		return nil, fmt.Errorf("file too small for v1 trailer")
 	}
-
 	if _, err := f.Seek(-int64(TrailerV1Size), io.SeekEnd); err != nil {
 		return nil, fmt.Errorf("seek failed: %w", err)
 	}
-
 	var trailer [TrailerV1Size]byte
 	if _, err := io.ReadFull(f, trailer[:]); err != nil {
 		return nil, fmt.Errorf("read failed: %w", err)
@@ -646,7 +577,6 @@ func tryReadV1Trailer(f *os.File, fileSize int64) (*PayloadInfo, error) {
 	if payloadSize < 0 {
 		return nil, fmt.Errorf("v1 trailer offset produces negative payload size")
 	}
-
 	if _, err := f.Seek(tarOffset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("cannot seek to v1 payload offset: %w", err)
 	}
@@ -657,9 +587,7 @@ func tryReadV1Trailer(f *os.File, fileSize int64) (*PayloadInfo, error) {
 	}, nil
 }
 
-// hashingWriter wraps an io.Writer and feeds all written bytes to a hash.Hash.
-// Used in AppendPayload to hash the tar.gz bytes as they're written to disk,
-// avoiding a second pass over the data.
+// hashingWriter tees all writes through a hash.Hash without extra copying.
 type hashingWriter struct {
 	w io.Writer
 	h hash.Hash
@@ -673,8 +601,7 @@ func (hw *hashingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// limitedReadCloser wraps a LimitReader and a Closer so FindPayload can
-// return an io.ReadCloser that closes the underlying file.
+// limitedReadCloser wraps LimitReader + Closer so FindPayload returns io.ReadCloser.
 type limitedReadCloser struct {
 	r io.Reader
 	c io.Closer

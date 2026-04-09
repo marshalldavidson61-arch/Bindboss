@@ -1,10 +1,36 @@
 // main.go
 // =============================================================================
-// GRUG: Entry point. Dispatches subcommands. No framework. Just a slice of
-// runners and a switch. Adding a new command = implement Runner, append it.
+// GRUG: Entry point. Grug dispatch subcommand. That is all grug do here.
+// No business logic. No parsing. No config. Just: "which command?" → go there.
 //
-// ACADEMIC: The Runner interface is the only abstraction. Each subcommand
-// owns its flag set and arg parsing. main() does nothing except route.
+// Commands:
+//   pack     — pack a directory into a self-extracting binary
+//   inspect  — print what is inside a packed binary
+//   verify   — check hash + optional Ed25519 signature
+//   keygen   — generate an Ed25519 keypair for signing
+//   reset    — delete first-run state so dep check runs again
+//
+// Adding a new command = implement Runner interface, append to runners slice.
+// That is the whole extension model. No plugin system. No reflection. Just
+// a slice and a loop.
+//
+// Error from any command = print to stderr, exit 1. Always. No silent exits.
+//
+// ---
+// ACADEMIC: The Runner interface is the only dispatch abstraction in bindboss.
+// Each subcommand owns its own flag.FlagSet and argument parsing — this is
+// the standard Go subcommand pattern (as used by `go`, `kubectl`, `docker`).
+// main() is a pure router: O(n) linear scan over a small fixed slice.
+//
+// The separation of concerns is strict:
+//   main.go      — routing only, no logic
+//   cmd/*.go     — CLI flag parsing, user-facing I/O, orchestration
+//   internal/*   — all business logic, no os.Exit, no flag parsing
+//   pkg/*        — library API, thin wrapper over internal, no os.Exit
+//   stub/stub.go — standalone binary, compiled separately with build tag
+//
+// This layering ensures that internal packages are testable in isolation
+// without any flag state or process lifecycle side effects.
 // =============================================================================
 
 package main
@@ -33,6 +59,7 @@ func main() {
 	}
 
 	if len(os.Args) < 2 {
+		// GRUG: no subcommand = print help and exit. not a panic. not a crash.
 		printUsage(runners)
 		os.Exit(1)
 	}
@@ -43,6 +70,7 @@ func main() {
 	for _, r := range runners {
 		if r.Name() == subcmd {
 			if err := r.Run(args); err != nil {
+				// GRUG: command failed = print error, exit 1. always. no silent exits.
 				fmt.Fprintf(os.Stderr, "[bindboss] %v\n", err)
 				os.Exit(1)
 			}
@@ -50,11 +78,13 @@ func main() {
 		}
 	}
 
+	// GRUG: unknown command = tell user exactly what they typed, then show help.
 	fmt.Fprintf(os.Stderr, "[bindboss] unknown command %q\n\n", subcmd)
 	printUsage(runners)
 	os.Exit(1)
 }
 
+// printUsage prints the top-level help listing all available commands.
 func printUsage(runners []Runner) {
 	fmt.Fprintf(os.Stderr, "bindboss — pack any directory into a self-extracting executable\n\n")
 	fmt.Fprintf(os.Stderr, "Usage:\n  bindboss <command> [args]\n\nCommands:\n")
@@ -65,6 +95,7 @@ func printUsage(runners []Runner) {
 }
 
 // firstLine returns the first non-empty line of a usage string.
+// Used to show a one-liner summary next to each command name.
 func firstLine(s string) string {
 	for _, line := range splitLines(s) {
 		if line != "" {
@@ -74,6 +105,8 @@ func firstLine(s string) string {
 	return s
 }
 
+// splitLines splits a string on newlines without using strings.Split
+// (avoids an import just for this tiny helper).
 func splitLines(s string) []string {
 	var lines []string
 	start := 0

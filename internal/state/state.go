@@ -1,17 +1,34 @@
 // state.go
 // =============================================================================
-// GRUG: This is the state cave. Tracks which bindboss-packed binaries have
-// already passed their first-run dependency check. Once a binary runs clean,
-// we write a state file so subsequent runs skip the dep check entirely.
+// GRUG: This is the state cave. Grug not want to run dep check every time.
+// Dep check = open browser, wait for human, slow. Once it passes, grug write
+// a note to disk: "check done, all good." Next run, grug sees note, skips
+// check entirely. Fast. Happy grug.
 //
-// ACADEMIC: First-run state is persisted to ~/.bindboss/<name>.state as a
-// simple key=value text file. JSON or TOML would be overkill — the state
-// only needs two fields: "checked" (bool) and "checked_at" (unix timestamp).
-// The file is created atomically (write to temp, rename) to avoid partial
-// writes from a crash during the first-run sequence.
+// State file lives at ~/.bindboss/<name>.state. Simple key=value text.
+// No JSON. No TOML. No sqlite. Two fields: checked=true, checked_at=<unix>.
+// That is ALL grug need.
 //
-// Users can run `bindboss reset <name>` to delete the state file and force
-// the dep check to run again (useful after a fresh OS install).
+// Run `bindboss reset <name>` to nuke the state file and force re-check.
+// Useful after fresh OS install, or if grug reinstalled a runtime and wants
+// to prove it works. Not an error if file missing — missing = first run.
+//
+// ---
+// ACADEMIC: First-run state is persisted to ~/.bindboss/<name>.state using
+// a minimalist key=value text format. JSON/TOML/protobuf are unnecessary
+// overhead for a two-field record.
+//
+// Atomicity: writes go to a temp file in the same directory (os.CreateTemp),
+// then os.Rename() into place. POSIX guarantees rename(2) is atomic on the
+// same filesystem. A crash mid-write leaves the old state file intact — the
+// binary simply re-runs the dep check on next launch instead of corrupting
+// state.
+//
+// Name sanitization: the binary name is user-controlled (basename of the
+// packed binary). We strip '/', '\', and NUL so the name cannot path-traverse
+// out of ~/.bindboss/ or inject null bytes into the filename. This is the
+// minimal safe set — we do not percent-encode or base64 because the result
+// must be human-readable in a directory listing.
 // =============================================================================
 
 package state
@@ -55,7 +72,8 @@ func statePath(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// GRUG: Sanitize name — no path separators, no dots that could escape dir.
+	// GRUG: strip path chars so name="../../etc/passwd" cannot escape the dir.
+	// '/' and '\' = path traversal. NUL = filename injection. Replace all with '_'.
 	safe := strings.Map(func(r rune) rune {
 		if r == '/' || r == '\\' || r == 0 {
 			return '_'
@@ -76,7 +94,7 @@ func Load(name string) (State, error) {
 
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		// GRUG: No state file = first run. Not an error.
+		// GRUG: no file = never ran before. that is fine. not an error.
 		return State{}, nil
 	}
 	if err != nil {
@@ -96,15 +114,15 @@ func Save(name string, s State) error {
 
 	content := serialize(s)
 
-	// GRUG: Write to temp file in the same directory, then atomic rename.
-	// Crash during write leaves the old state file intact.
+	// GRUG: write temp first, then rename. crash during write = old state survives.
+	// never write directly to the real path — partial writes corrupt state.
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".bindboss-state-*")
 	if err != nil {
 		return fmt.Errorf("!!! FATAL: cannot create temp file for state write: %w", err)
 	}
 	tmpPath := tmp.Name()
 
-	defer os.Remove(tmpPath) // no-op after successful rename
+	defer os.Remove(tmpPath) // GRUG: no-op if rename succeeded. safety net only.
 
 	if _, err := tmp.WriteString(content); err != nil {
 		tmp.Close()
@@ -121,8 +139,8 @@ func Save(name string, s State) error {
 }
 
 // Reset deletes the state file for the named binary.
-// Subsequent runs will treat it as a first run and re-check dependencies.
-// Not an error if the file doesn't exist.
+// The next run will treat the binary as a first run and re-check dependencies.
+// Not an error if the file doesn't exist — idempotent.
 func Reset(name string) error {
 	path, err := statePath(name)
 	if err != nil {
@@ -135,6 +153,7 @@ func Reset(name string) error {
 }
 
 // MarkChecked saves a State with Checked=true and CheckedAt=now.
+// This is the normal call after a successful first-run dep check.
 func MarkChecked(name string) error {
 	return Save(name, State{
 		Checked:   true,
@@ -153,6 +172,7 @@ func parse(data []byte) (State, error) {
 	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
+			// GRUG: blank lines and comments = skip. future-proofing for annotations.
 			continue
 		}
 		parts := strings.SplitN(line, "=", 2)
@@ -173,6 +193,7 @@ func parse(data []byte) (State, error) {
 				return State{}, fmt.Errorf("!!! FATAL: invalid 'checked_at' value in state file: %q", v)
 			}
 			s.CheckedAt = n
+		// GRUG: unknown keys = ignore. forward-compat if we add fields later.
 		}
 	}
 	return s, nil
