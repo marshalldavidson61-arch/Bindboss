@@ -1,0 +1,40 @@
+{
+  "title": "GrugBot420",
+  "version": "1.0.0",
+  "steps": [
+    {
+      "type": "welcome",
+      "title": "Welcome",
+      "content": "Welcome to the GrugBot420 installer!\n\nThis wizard will check for required dependencies and help you\ninstall anything that's missing. It should only take a minute.\n\nYou'll need:\n  • Julia 1.9 or later (the language GrugBot runs on)\n  • About 500MB of free disk space\n\nPress Enter to get started, or Ctrl+C to abort."
+    },
+    {
+      "type": "license",
+      "title": "License Agreement",
+      "content": "MIT License\n\nCopyright (c) 2024 marshalldavidson61-arch\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE."
+    },
+    {
+      "type": "deps",
+      "title": "Dependencies",
+      "deps": [
+        {
+          "name": "Julia 1.9+",
+          "check": "julia --version",
+          "download_url": "https://julialang-s3.julialang.org/bin/linux/x64/1.10/julia-1.10.2-linux-x86_64.tar.gz",
+          "file_name": "julia-installer.tar.gz",
+          "fallback_url": "https://julialang.org/downloads/",
+          "message": "Julia is the language runtime that GrugBot needs. Version 1.9 or later required."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "title": "Configuration",
+      "content": "Dependencies are installed! GrugBot will now be configured.\n\nDefault settings:\n  • Specimen file: grugbot420.specimen.gz (auto-created on first run)\n  • Mode: interactive CLI\n  • Arousal: 0.5 (neutral)\n\nThese can be changed later in bindboss.toml or via GrugBot's /config command."
+    },
+    {
+      "type": "finish",
+      "title": "Complete",
+      "content": "  ✓ GrugBot420 is ready to run!\n\n  The application will start automatically after this wizard closes.\n  Next time you launch, this wizard will not appear (deps are cached).\n\n  To re-run this wizard:  bindboss reset grugbot420\n  To inspect the binary:  bindboss inspect grugbot420\n\n  Happy grugging! 🦖"
+    }
+  ]
+}

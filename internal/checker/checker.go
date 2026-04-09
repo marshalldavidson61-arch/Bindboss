@@ -5,6 +5,11 @@
 // Open browser, show install page, wait for human to install, check again.
 // Loop until found or human gives up (Ctrl+C). No silent skip. No guessing.
 //
+// NOTE: The install wizard (internal/installer) is the preferred path for new
+// configs. It uses HTTP downloads instead of browser opens and provides a
+// guided multi-step UI. This package remains for backward compatibility with
+// configs that don't define an [install] section.
+//
 // Check command = anything that exits 0 when tool present. "julia --version"
 // works. "node --version" works. "which python3" works. Grug not care what
 // the output is — only exit code matters. 0 = here. nonzero = not here.
