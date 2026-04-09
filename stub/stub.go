@@ -3,13 +3,15 @@
 // GRUG: This is the stub cave. When a user runs a bindboss-packed binary,
 // THIS is the code that executes. It:
 //   1. Locates its own payload (the appended tar.gz)
-//   2. Checks deps on first run (skips on subsequent runs via state file)
-//   3. Extracts the packed directory to a temp or persist location
-//   4. Sets environment variables from config
-//   5. Execs the run command with full stdin/stdout/stderr passthrough
-//   6. Forwards signals so Ctrl+C reaches the child process
-//   7. Cleans up the tmpdir on exit (unless --persist)
-//   8. Exits with the child's exit code
+//   2. Optionally verifies the payload hash (if BINDBOSS_VERIFY is set)
+//   3. Checks deps on first run (skips on subsequent runs via state file)
+//   4. Runs pre_run hooks
+//   5. Extracts the packed directory to a temp or persist location
+//   6. Sets environment variables from config
+//   7. Execs the run command with full stdin/stdout/stderr passthrough
+//   8. Runs post_run hooks (exec_mode="fork" only — see note below)
+//   9. Cleans up the tmpdir on exit (unless persist)
+//  10. Exits with the child's exit code
 //
 // ACADEMIC: The exec model used here is NOT os/exec.Cmd.Run(). We use
 // syscall.Exec (on Unix) which replaces the current process image entirely
@@ -17,6 +19,9 @@
 // same, signal handling is clean, and there's no wrapper overhead.
 // On Windows, syscall.Exec is not available, so we fall back to cmd.Run()
 // with manual signal forwarding via os/signal.
+//
+// exec_mode="fork" forces cmd.Run() on Unix too — useful when post_run hooks
+// must fire, at the cost of a wrapper process. Default is "exec".
 //
 // The stub is compiled separately as part of the bindboss pack step and its
 // binary is embedded into the bindboss packer via go:embed. When packing,
@@ -44,6 +49,7 @@ import (
 	"github.com/marshalldavidson61-arch/bindboss/internal/archive"
 	"github.com/marshalldavidson61-arch/bindboss/internal/checker"
 	"github.com/marshalldavidson61-arch/bindboss/internal/config"
+	"github.com/marshalldavidson61-arch/bindboss/internal/hooks"
 	"github.com/marshalldavidson61-arch/bindboss/internal/state"
 )
 
@@ -62,14 +68,36 @@ func main() {
 	// ------------------------------------------------------------------
 	// STEP 1: Find and validate the appended payload
 	// ------------------------------------------------------------------
-	payloadReader, err := archive.FindPayload(selfPath)
+	payloadInfo, err := archive.FindPayload(selfPath)
 	if err != nil {
 		fatalf("%v", err)
 	}
-	defer payloadReader.Close()
+	defer payloadInfo.Reader.Close()
 
 	// ------------------------------------------------------------------
-	// STEP 2: Determine extract directory
+	// STEP 2: Optional hash verification
+	// GRUG: If BINDBOSS_VERIFY=1 is set, verify the payload hash before
+	// extraction. This catches tampering or corruption before we exec anything.
+	// Off by default — verification adds a full re-read of the payload.
+	// ------------------------------------------------------------------
+	if os.Getenv("BINDBOSS_VERIFY") == "1" {
+		if !payloadInfo.HashPresent {
+			fatalf("BINDBOSS_VERIFY=1 but binary %q has no stored hash (v1 format) — repack to enable verification", selfPath)
+		}
+		// GRUG: Close and reopen for verification — FindPayload consumed the reader.
+		payloadInfo.Reader.Close()
+		if err := archive.VerifyHash(selfPath); err != nil {
+			fatalf("%v", err)
+		}
+		// Reopen for extraction
+		payloadInfo, err = archive.FindPayload(selfPath)
+		if err != nil {
+			fatalf("%v", err)
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// STEP 3: Determine extract directory
 	// ------------------------------------------------------------------
 	binaryName := filepath.Base(selfPath)
 
@@ -79,7 +107,7 @@ func main() {
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 3: Extract payload (skip if persist dir already exists)
+	// STEP 4: Extract payload (skip if persist dir already exists with content)
 	// ------------------------------------------------------------------
 	needsExtract := true
 	if _, statErr := os.Stat(extractDir); statErr == nil {
@@ -92,13 +120,13 @@ func main() {
 	}
 
 	if needsExtract {
-		if err := archive.Extract(payloadReader, extractDir); err != nil {
+		if err := archive.Extract(payloadInfo.Reader, extractDir); err != nil {
 			fatalf("%v", err)
 		}
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 4: Load config from extracted directory
+	// STEP 5: Load config from extracted directory
 	// ------------------------------------------------------------------
 	cfg, err := config.Load(extractDir)
 	if err != nil {
@@ -115,7 +143,7 @@ func main() {
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 5: Dependency check (first run only)
+	// STEP 6: Dependency check (first run only)
 	// ------------------------------------------------------------------
 	if len(cfg.Needs) > 0 {
 		st, err := state.Load(cfg.Name)
@@ -137,7 +165,7 @@ func main() {
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 6: Build environment
+	// STEP 7: Build environment
 	// ------------------------------------------------------------------
 	env := os.Environ()
 	for _, kv := range cfg.Env {
@@ -145,7 +173,17 @@ func main() {
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 7: Parse and exec run command
+	// STEP 8: Run pre_run hooks
+	// ------------------------------------------------------------------
+	if len(cfg.Hooks.PreRun) > 0 {
+		fmt.Fprintf(os.Stderr, "[bindboss] running pre_run hooks...\n")
+		if err := hooks.Runner(cfg.Hooks.PreRun, extractDir, cfg.Name, env); err != nil {
+			fatalf("%v", err)
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// STEP 9: Parse and exec run command
 	// ------------------------------------------------------------------
 	parts := splitCmd(cfg.Run)
 	if len(parts) == 0 {
@@ -169,34 +207,56 @@ func main() {
 	argv = append(argv, os.Args[1:]...)
 
 	// ------------------------------------------------------------------
-	// STEP 8: Cleanup registration (before exec replaces us on Unix)
+	// STEP 10: Choose exec strategy based on exec_mode and platform
 	// ------------------------------------------------------------------
-	// GRUG: On Unix, syscall.Exec replaces us — deferred cleanup won't run.
-	// We handle cleanup here via a pre-exec signal handler only on Windows
-	// where we use cmd.Run() instead of Exec.
-	if cleanup != nil {
-		defer cleanup()
-	}
+	useFork := cfg.ExecMode == "fork" || runtime.GOOS == "windows"
 
-	// ------------------------------------------------------------------
-	// STEP 9: Exec
-	// ------------------------------------------------------------------
-	if runtime.GOOS != "windows" {
-		// GRUG: Unix path — replace this process with the child. Clean and signal-safe.
+	if !useFork {
+		// GRUG: Unix exec path — replace this process with the child.
+		// Clean and signal-safe. post_run hooks CANNOT fire after this.
 		// The OS handles stdin/stdout/stderr inheritance automatically.
+		if cleanup != nil {
+			// GRUG: On Unix exec path, deferred cleanup won't run.
+			// The tmpdir will be cleaned up by the OS on reboot, or
+			// the user can run `bindboss reset <name>`.
+			// If Cleanup=true and Persist=false, log a note.
+			fmt.Fprintf(os.Stderr, "[bindboss] note: tmpdir %s will not be auto-cleaned (exec mode)\n", extractDir)
+		}
 		if err := syscall.Exec(cmdPath, argv, env); err != nil {
 			fatalf("exec failed: %v", err)
 		}
 		// GRUG: Unreachable after syscall.Exec succeeds.
-	} else {
-		// GRUG: Windows path — no syscall.Exec, so use cmd.Run() with signal forwarding.
-		runWithSignalForwarding(cmdPath, argv, env, extractDir)
 	}
+
+	// Fork path: keep stub alive so post_run and cleanup can fire.
+	exitCode := runWithSignalForwarding(cmdPath, argv, env, extractDir)
+
+	// ------------------------------------------------------------------
+	// STEP 11: post_run hooks (fork/Windows path only)
+	// ------------------------------------------------------------------
+	if len(cfg.Hooks.PostRun) > 0 {
+		fmt.Fprintf(os.Stderr, "[bindboss] running post_run hooks...\n")
+		if err := hooks.Runner(cfg.Hooks.PostRun, extractDir, cfg.Name, env); err != nil {
+			// GRUG: post_run failure is logged but doesn't change the exit code.
+			// The main command already finished — we can't un-run it.
+			fmt.Fprintf(os.Stderr, "[bindboss] warning: post_run hook failed: %v\n", err)
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// STEP 12: Cleanup (fork/Windows path only)
+	// ------------------------------------------------------------------
+	if cleanup != nil {
+		cleanup()
+	}
+
+	os.Exit(exitCode)
 }
 
-// runWithSignalForwarding runs the child command on Windows with os/signal
-// forwarding so Ctrl+C reaches the child instead of killing the wrapper.
-func runWithSignalForwarding(cmdPath string, argv []string, env []string, workDir string) {
+// runWithSignalForwarding runs the child command with os/signal forwarding
+// so Ctrl+C reaches the child instead of killing the wrapper.
+// Returns the child's exit code.
+func runWithSignalForwarding(cmdPath string, argv []string, env []string, workDir string) int {
 	cmd := exec.Command(cmdPath, argv[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -221,10 +281,12 @@ func runWithSignalForwarding(cmdPath string, argv []string, env []string, workDi
 
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
+			return exitErr.ExitCode()
 		}
 		fatalf("child process error: %v", err)
 	}
+
+	return 0
 }
 
 // resolveExtractDir determines where to extract the packed directory.

@@ -1,8 +1,8 @@
 // inspect.go
 // =============================================================================
 // GRUG: The inspect command. Reads the payload from a packed binary and prints
-// its config — run command, deps, extract settings. Useful to verify what a
-// binary will do before running it, or to debug a pack that isn't working.
+// its config — run command, deps, hooks, hash, sig status. Useful to verify
+// what a binary will do before running it, or to debug a pack.
 // =============================================================================
 
 package cmd
@@ -67,13 +67,13 @@ func (c *InspectCmd) Run(args []string) error {
 	}
 
 	// ------------------------------------------------------------------
-	// Extract to a temp dir so we can read the config
+	// Find payload — get PayloadInfo for hash/sig metadata
 	// ------------------------------------------------------------------
-	payloadReader, err := archive.FindPayload(absPath)
+	payloadInfo, err := archive.FindPayload(absPath)
 	if err != nil {
 		return err
 	}
-	defer payloadReader.Close()
+	defer payloadInfo.Reader.Close()
 
 	tmpDir, err := os.MkdirTemp("", "bindboss-inspect-*")
 	if err != nil {
@@ -81,7 +81,7 @@ func (c *InspectCmd) Run(args []string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	if err := archive.Extract(payloadReader, tmpDir); err != nil {
+	if err := archive.Extract(payloadInfo.Reader, tmpDir); err != nil {
 		return err
 	}
 
@@ -93,9 +93,25 @@ func (c *InspectCmd) Run(args []string) error {
 	// ------------------------------------------------------------------
 	// Print config
 	// ------------------------------------------------------------------
-	fmt.Printf("binary:  %s\n", binPath)
-	fmt.Printf("name:    %s\n", cfg.Name)
-	fmt.Printf("run:     %s\n", cfg.Run)
+	fmt.Printf("binary:    %s\n", binPath)
+	fmt.Printf("name:      %s\n", cfg.Name)
+	fmt.Printf("run:       %s\n", cfg.Run)
+	fmt.Printf("exec_mode: %s\n", cfg.ExecMode)
+
+	// Hash / sig status
+	if payloadInfo.V1 {
+		fmt.Printf("format:    v1 (legacy — no hash/sig)\n")
+	} else {
+		fmt.Printf("format:    v2\n")
+		if payloadInfo.HashPresent {
+			fmt.Printf("hash:      %x\n", payloadInfo.Hash)
+		}
+		if payloadInfo.SigPresent {
+			fmt.Printf("signed:    yes (Ed25519)\n")
+		} else {
+			fmt.Printf("signed:    no\n")
+		}
+	}
 
 	if len(cfg.Env) > 0 {
 		fmt.Printf("env:\n")
@@ -115,12 +131,25 @@ func (c *InspectCmd) Run(args []string) error {
 			}
 		}
 	} else {
-		fmt.Printf("deps:    (none)\n")
+		fmt.Printf("deps:      (none)\n")
 	}
 
-	fmt.Printf("persist: %v\n", cfg.Extract.Persist)
+	if len(cfg.Hooks.PreRun) > 0 {
+		fmt.Printf("pre_run hooks:\n")
+		for i, h := range cfg.Hooks.PreRun {
+			fmt.Printf("  [%d] %s\n", i, h)
+		}
+	}
+	if len(cfg.Hooks.PostRun) > 0 {
+		fmt.Printf("post_run hooks:\n")
+		for i, h := range cfg.Hooks.PostRun {
+			fmt.Printf("  [%d] %s\n", i, h)
+		}
+	}
+
+	fmt.Printf("persist:   %v\n", cfg.Extract.Persist)
 	if cfg.Extract.Dir != "" {
-		fmt.Printf("dir:     %s\n", cfg.Extract.Dir)
+		fmt.Printf("dir:       %s\n", cfg.Extract.Dir)
 	}
 
 	// ------------------------------------------------------------------

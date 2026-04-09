@@ -1,18 +1,10 @@
 // main.go
 // =============================================================================
-// GRUG: This is the front door of the cave. Parses the subcommand and routes
-// to the right handler. No framework, no magic — just a switch and a runner
-// interface. Each subcommand owns its own flag.FlagSet so --help works per
-// command without poisoning the global flag state.
+// GRUG: Entry point. Dispatches subcommands. No framework. Just a slice of
+// runners and a switch. Adding a new command = implement Runner, append it.
 //
-// ACADEMIC: The subcommand dispatch pattern used here mirrors the Go standard
-// library's own tool layout (go build, go test, etc.). Each command implements
-// the Runner interface: Name() string, Run(args []string) error. The main
-// function registers commands in a slice, finds the matching name, and calls
-// Run with os.Args[2:]. Unrecognized subcommands print a help listing.
-//
-// Build tag absence (no "stub" tag) means this file compiles as the bindboss
-// CLI tool. The stub/stub.go file uses `//go:build stub` so it's excluded here.
+// ACADEMIC: The Runner interface is the only abstraction. Each subcommand
+// owns its flag set and arg parsing. main() does nothing except route.
 // =============================================================================
 
 package main
@@ -24,18 +16,6 @@ import (
 	"github.com/marshalldavidson61-arch/bindboss/cmd"
 )
 
-const version = "0.1.0"
-
-const banner = `
-  _     _           _ _
- | |__ (_)_ __   __| | |__   ___  ___ ___
- | '_ \| | '_ \ / _  | '_ \ / _ \/ __/ __|
- | |_) | | | | | (_| | |_) | (_) \__ \__ \
- |_.__/|_|_| |_|\__,_|_.__/ \___/|___/___/
-
- pack a directory. ship one binary. works anywhere.
- v` + version + "\n"
-
 // Runner is implemented by every bindboss subcommand.
 type Runner interface {
 	Name() string
@@ -44,61 +24,67 @@ type Runner interface {
 }
 
 func main() {
-	commands := []Runner{
+	runners := []Runner{
 		cmd.NewPackCmd(),
-		cmd.NewResetCmd(),
 		cmd.NewInspectCmd(),
+		cmd.NewResetCmd(),
+		cmd.NewVerifyCmd(),
+		cmd.NewKeygenCmd(),
 	}
 
 	if len(os.Args) < 2 {
-		printHelp(commands)
-		os.Exit(0)
+		printUsage(runners)
+		os.Exit(1)
 	}
 
-	sub := os.Args[1]
+	subcmd := os.Args[1]
+	args := os.Args[2:]
 
-	// GRUG: Handle global flags before subcommand dispatch.
-	switch sub {
-	case "-v", "--version", "version":
-		fmt.Printf("bindboss %s\n", version)
-		os.Exit(0)
-	case "-h", "--help", "help":
-		printHelp(commands)
-		os.Exit(0)
-	}
-
-	for _, c := range commands {
-		if c.Name() == sub {
-			if err := c.Run(os.Args[2:]); err != nil {
-				fmt.Fprintf(os.Stderr, "[bindboss] error: %v\n", err)
+	for _, r := range runners {
+		if r.Name() == subcmd {
+			if err := r.Run(args); err != nil {
+				fmt.Fprintf(os.Stderr, "[bindboss] %v\n", err)
 				os.Exit(1)
 			}
-			os.Exit(0)
+			return
 		}
 	}
 
-	// GRUG: Unknown subcommand — print help and exit nonzero. Not silent.
-	fmt.Fprintf(os.Stderr, "[bindboss] unknown command %q\n\n", sub)
-	printHelp(commands)
+	fmt.Fprintf(os.Stderr, "[bindboss] unknown command %q\n\n", subcmd)
+	printUsage(runners)
 	os.Exit(1)
 }
 
-func printHelp(commands []Runner) {
-	fmt.Print(banner)
-	fmt.Println("Usage:")
-	fmt.Println("  bindboss <command> [arguments]")
-	fmt.Println()
-	fmt.Println("Commands:")
-	for _, c := range commands {
-		fmt.Printf("  %-12s\n", c.Name())
+func printUsage(runners []Runner) {
+	fmt.Fprintf(os.Stderr, "bindboss — pack any directory into a self-extracting executable\n\n")
+	fmt.Fprintf(os.Stderr, "Usage:\n  bindboss <command> [args]\n\nCommands:\n")
+	for _, r := range runners {
+		fmt.Fprintf(os.Stderr, "  %-10s %s\n", r.Name(), firstLine(r.Usage()))
 	}
-	fmt.Println()
-	fmt.Println("Run 'bindboss <command> --help' for command-specific usage.")
-	fmt.Println()
-	fmt.Println("Quick start:")
-	fmt.Println("  bindboss pack ./myapp myapp --run=\"python main.py\"")
-	fmt.Println("  bindboss pack ./grugbot grugbot --run=\"julia main.jl\" \\")
-	fmt.Println("    --needs=\"julia,julia --version,https://julialang.org/downloads/\"")
-	fmt.Println("  bindboss inspect ./grugbot")
-	fmt.Println("  bindboss reset grugbot")
+	fmt.Fprintf(os.Stderr, "\nRun `bindboss <command>` with no args for command help.\n")
+}
+
+// firstLine returns the first non-empty line of a usage string.
+func firstLine(s string) string {
+	for _, line := range splitLines(s) {
+		if line != "" {
+			return line
+		}
+	}
+	return s
+}
+
+func splitLines(s string) []string {
+	var lines []string
+	start := 0
+	for i, ch := range s {
+		if ch == '\n' {
+			lines = append(lines, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		lines = append(lines, s[start:])
+	}
+	return lines
 }

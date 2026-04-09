@@ -10,6 +10,9 @@
 //   3. Append the packed directory + trailer to the output binary.
 // The config (bindboss.toml or CLI flags) is written into the directory before
 // archiving, so the stub finds it on extraction.
+//
+// v2 trailer: hash is always computed and stored. --sign=<keyfile> adds an
+// Ed25519 signature over the payload hash for integrity invariant enforcement.
 // =============================================================================
 
 package cmd
@@ -23,8 +26,11 @@ import (
 	"runtime"
 	"strings"
 
+	"crypto/ed25519"
+
 	"github.com/marshalldavidson61-arch/bindboss/internal/archive"
 	"github.com/marshalldavidson61-arch/bindboss/internal/config"
+	"github.com/marshalldavidson61-arch/bindboss/internal/keys"
 )
 
 // PackCmd implements `bindboss pack`.
@@ -35,6 +41,7 @@ type PackCmd struct {
 	persist bool
 	target  string // GOOS/GOARCH e.g. "linux/amd64"
 	dir     string // extract dir override
+	sign    string // path to .key file for Ed25519 signing
 }
 
 func NewPackCmd() *PackCmd {
@@ -44,6 +51,7 @@ func NewPackCmd() *PackCmd {
 	c.fs.BoolVar(&c.persist, "persist", false, "extract to a fixed directory instead of a fresh tmpdir each run")
 	c.fs.StringVar(&c.target, "target", "", "cross-compile target as GOOS/GOARCH (default: current platform)")
 	c.fs.StringVar(&c.dir, "dir", "", "override extract directory (default: ~/.bindboss/<name>/)")
+	c.fs.StringVar(&c.sign, "sign", "", "path to Ed25519 private key file for payload signing (generated with `bindboss keygen`)")
 	return c
 }
 
@@ -57,6 +65,7 @@ func (c *PackCmd) Usage() string {
     bindboss pack ./myapp myapp --run="python main.py"
     bindboss pack ./grugbot grugbot --run="julia main.jl" --needs="julia,julia --version,https://julialang.org/downloads/"
     bindboss pack ./webapp webapp --run="bun run index.ts" --needs="bun,bun --version,https://bun.sh" --persist
+    bindboss pack ./app app --run="./app" --sign=~/.bindboss/keys/mykey.key
 
   Flags:`
 }
@@ -117,6 +126,18 @@ func (c *PackCmd) Run(args []string) error {
 	}
 
 	// ------------------------------------------------------------------
+	// Load signing key if --sign was provided
+	// ------------------------------------------------------------------
+	var privKey ed25519.PrivateKey
+	if c.sign != "" {
+		privKey, err = keys.LoadPrivateKey(c.sign)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("[bindboss] signing with key: %s\n", c.sign)
+	}
+
+	// ------------------------------------------------------------------
 	// Write merged config into source dir as bindboss.toml
 	// GRUG: We write the config INTO a temp copy of the source dir so the
 	// original directory is not modified. The stub reads it on extraction.
@@ -161,10 +182,10 @@ func (c *PackCmd) Run(args []string) error {
 	}
 
 	// ------------------------------------------------------------------
-	// Append payload to stub
+	// Append payload to stub (with hash + optional sig)
 	// ------------------------------------------------------------------
 	fmt.Printf("[bindboss] packing %s into %s...\n", srcDir, outPath)
-	if err := archive.AppendPayload(outPath, tmpSrc); err != nil {
+	if err := archive.AppendPayload(outPath, tmpSrc, privKey); err != nil {
 		return err
 	}
 
@@ -176,11 +197,22 @@ func (c *PackCmd) Run(args []string) error {
 	}
 	fmt.Printf("[bindboss] ✓ packed: %s (%.1f MB)\n", outPath, sizeMB)
 	fmt.Printf("[bindboss]   run command: %s\n", cfg.Run)
+	if c.sign != "" {
+		fmt.Printf("[bindboss]   signed: yes (Ed25519)\n")
+	} else {
+		fmt.Printf("[bindboss]   hash: yes (SHA-256, unsigned)\n")
+	}
 	if len(cfg.Needs) > 0 {
 		fmt.Printf("[bindboss]   deps checked on first run:\n")
 		for _, d := range cfg.Needs {
 			fmt.Printf("[bindboss]     - %s (%s)\n", d.Name, d.Check)
 		}
+	}
+	if len(cfg.Hooks.PreRun) > 0 {
+		fmt.Printf("[bindboss]   pre_run hooks: %d\n", len(cfg.Hooks.PreRun))
+	}
+	if len(cfg.Hooks.PostRun) > 0 {
+		fmt.Printf("[bindboss]   post_run hooks: %d (exec_mode=fork required on Unix)\n", len(cfg.Hooks.PostRun))
 	}
 
 	return nil
@@ -297,7 +329,7 @@ func copyDir(srcDir, destDir string) error {
 // multiFlag is a flag.Value that accumulates multiple --needs flags.
 type multiFlag []string
 
-func (m *multiFlag) String() string  { return strings.Join(*m, ", ") }
+func (m *multiFlag) String() string { return strings.Join(*m, ", ") }
 func (m *multiFlag) Set(v string) error {
 	*m = append(*m, v)
 	return nil

@@ -19,21 +19,64 @@ jobs:
         with:
           go-version: "1.23"
 
-      - name: Download dependencies
-        run: go mod download
+      - name: Test all packages
+        run: go test ./internal/... ./pkg/... -v -count=1
 
-      - name: Run tests
-        run: go test ./internal/... -v -count=1
+      - name: Build CLI
+        run: go build -o bindboss_cli .
 
-      - name: Build bindboss
-        run: go build -o bindboss .
-
-      - name: Smoke test — pack and inspect
+      - name: Integration — pack, inspect, verify, run
         run: |
-          mkdir -p testdata/ci-hello
-          echo '#!/bin/sh' > testdata/ci-hello/run.sh
-          echo 'echo "bindboss CI smoke test OK"' >> testdata/ci-hello/run.sh
-          chmod +x testdata/ci-hello/run.sh
-          ./bindboss pack testdata/ci-hello ci-hello --run="sh run.sh"
-          ./bindboss inspect ci-hello --list
-          ./ci-hello
+          # Pack
+          ./bindboss_cli pack testdata/hello hello-test --run="sh run.sh"
+
+          # Inspect — check it has a hash line
+          ./bindboss_cli inspect hello-test | grep "^hash:"
+
+          # Verify hash
+          ./bindboss_cli verify hello-test
+
+          # Run — expect "Hello from inside bindboss!" on stdout
+          OUTPUT=$(./hello-test 2>/dev/null)
+          echo "Output: $OUTPUT"
+          echo "$OUTPUT" | grep -q "Hello from inside bindboss!" || (echo "FAIL: unexpected output"; exit 1)
+
+      - name: Integration — keygen + sign + verify-sig
+        run: |
+          mkdir -p /tmp/ci-keys
+          ./bindboss_cli keygen cikey --keydir=/tmp/ci-keys
+          ./bindboss_cli pack testdata/hello hello-signed \
+            --run="sh run.sh" \
+            --sign=/tmp/ci-keys/cikey.key
+          ./bindboss_cli inspect hello-signed | grep "^signed:    yes"
+          ./bindboss_cli verify hello-signed --pubkey=/tmp/ci-keys/cikey.pub
+
+      - name: Integration — tamper detection
+        run: |
+          # Flip a byte in the payload and verify that VerifyHash catches it
+          python3 -c "
+          import sys
+          data = bytearray(open('hello-test','rb').read())
+          # payload starts at byte 9 of a typical stub... actually just flip near the middle
+          mid = len(data) // 2
+          data[mid] ^= 0xFF
+          open('hello-tampered','wb').write(data)
+          os.chmod('hello-tampered', 0o755)
+          " 2>/dev/null || python3 -c "
+          import os
+          data = bytearray(open('hello-test','rb').read())
+          mid = len(data) // 2
+          data[mid] ^= 0xFF
+          open('hello-tampered','wb').write(bytes(data))
+          os.chmod('hello-tampered', 0o755)
+          "
+          # verify should FAIL (exit non-zero) on tampered binary
+          if ./bindboss_cli verify hello-tampered 2>/dev/null; then
+            echo "FAIL: verify passed on tampered binary"
+            exit 1
+          else
+            echo "PASS: verify correctly rejected tampered binary"
+          fi
+
+      - name: Stub build tags (sanity check)
+        run: go build -tags stub -o /dev/null ./stub/

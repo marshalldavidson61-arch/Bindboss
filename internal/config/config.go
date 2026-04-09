@@ -5,7 +5,7 @@
 //
 // ACADEMIC: Configuration follows a two-layer merge strategy. The on-disk
 // bindboss.toml provides authoring-time defaults (run command, deps, extract
-// behavior). CLI flags at invocation time override any field. This allows
+// behavior, hooks). CLI flags at invocation time override any field. This allows
 // the same packed binary to be re-run with different flags without repacking.
 //
 // Config is parsed once at startup and passed as a value through the call chain.
@@ -49,6 +49,24 @@ type Extract struct {
 	Cleanup bool `toml:"cleanup"`
 }
 
+// Hooks declares shell commands to run before and after the main run command.
+//
+// GRUG: pre_run fires before dep check and before the main command.
+// post_run fires after the main command exits — but ONLY on Windows or when
+// exec_mode="fork". On Unix the stub uses syscall.Exec which replaces this
+// process entirely, so post_run cannot fire. Document this; don't hide it.
+type Hooks struct {
+	// PreRun: list of commands to run before the main command.
+	// Each command is a shell-style string (no shell expansion, just argv split).
+	// Example: ["mkdir -p data", "chmod 755 setup.sh"]
+	PreRun []string `toml:"pre_run"`
+
+	// PostRun: list of commands to run after the main command exits.
+	// WARNING: on Unix with exec_mode="exec" (default), these NEVER run.
+	// See hooks.go for full explanation.
+	PostRun []string `toml:"post_run"`
+}
+
 // Config is the full bindboss configuration for a packed binary.
 // It is populated from bindboss.toml (if present in the packed dir)
 // and then overridden by any CLI flags passed at pack or run time.
@@ -60,6 +78,12 @@ type Config struct {
 	// Example: "julia main.jl" or "bun run index.ts"
 	Run string `toml:"run"`
 
+	// ExecMode: "exec" (default, Unix syscall.Exec) or "fork" (os/exec.Cmd.Run).
+	// "exec" replaces the process — clean PID, no wrapper overhead, no post_run.
+	// "fork" keeps the stub alive — post_run hooks fire, but there's a wrapper process.
+	// GRUG: Use "exec" unless you need post_run hooks on Unix.
+	ExecMode string `toml:"exec_mode"`
+
 	// Env: additional environment variables to set before running.
 	// Format: ["KEY=value", "OTHER=value2"]
 	Env []string `toml:"env"`
@@ -69,12 +93,17 @@ type Config struct {
 
 	// Extract: controls extraction behavior.
 	Extract Extract `toml:"extract"`
+
+	// Hooks: pre/post run commands.
+	Hooks Hooks `toml:"hooks"`
 }
 
 // DefaultConfig returns a Config with safe defaults.
 // Cleanup=true keeps the host tidy. Persist=false is conservative.
+// ExecMode="exec" is the Unix-optimal path.
 func DefaultConfig() Config {
 	return Config{
+		ExecMode: "exec",
 		Extract: Extract{
 			Persist: false,
 			Cleanup: true,
@@ -193,12 +222,22 @@ func ParseDepFlag(raw string) (Dep, error) {
 
 // Validate checks that a Config is complete enough to run.
 // Returns an error if the run command is empty — that's the only hard requirement.
+// Also validates exec_mode if set.
 func Validate(cfg Config) error {
 	if strings.TrimSpace(cfg.Run) == "" {
 		return fmt.Errorf(
 			"!!! FATAL: no run command specified — " +
 				"set 'run' in bindboss.toml or pass --run=\"cmd\"")
 	}
+
+	switch cfg.ExecMode {
+	case "", "exec", "fork":
+		// valid
+	default:
+		return fmt.Errorf(
+			"!!! FATAL: invalid exec_mode %q — must be \"exec\" or \"fork\"", cfg.ExecMode)
+	}
+
 	return nil
 }
 

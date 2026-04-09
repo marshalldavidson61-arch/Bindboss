@@ -1,41 +1,33 @@
 # bindboss
 
-**Pack a directory into a single executable binary. Ship it anywhere. One command.**
+Pack any directory into a single self-extracting executable — with dependency checking, integrity hashing, optional signing, pre/post hooks, and a clean Go library API.
 
 ```
-bindboss pack ./myapp myapp --run="julia main.jl"
+bindboss pack ./myapp myapp-bin --run="julia main.jl" --needs="julia,julia --version,https://julialang.org/downloads/"
 ```
 
-That's it. `myapp` is now a self-contained binary that extracts itself and runs on any machine — no install instructions, no "make sure you have X installed first", no Docker.
+That's it. One binary. Runs anywhere the target platform supports.
 
 ---
 
-## What it does
+## Why
 
-`bindboss` appends your entire project directory to a compiled stub binary as a compressed archive. When the output binary runs:
-
-1. Extracts the directory to a temp location
-2. On **first run only**: checks for required runtimes. If missing, opens the download URL and waits for you to install before continuing
-3. Runs your command from inside the extracted directory
-4. Cleans up on exit
-
-The dep check only happens once. State is saved to `~/.bindboss/<name>.state`. Subsequent runs skip straight to execution.
+Compiling Julia is slow and painful. Bundling Bun the official way is verbose and fragile. You shouldn't need a PhD to ship a directory as an executable. bindboss does one thing: take a directory, a run command, and optional dependency metadata — and produce a single portable binary that handles everything on first run.
 
 ---
 
 ## Install
 
 ```sh
-git clone https://github.com/marshalldavidson61-arch/bindboss
-cd bindboss
-go build -o bindboss .
-# put bindboss on your PATH
+go install github.com/marshalldavidson61-arch/bindboss@latest
 ```
 
-Or with `go install` (requires Go 1.23+):
+Or clone and build from source (requires Go 1.23+):
 
 ```sh
-go install github.com/marshalldavidson61-arch/bindboss@latest
+git clone https://github.com/marshalldavidson61-arch/Bindboss
+cd Bindboss
+go build -o bindboss .
 ```
 
 ---
@@ -47,148 +39,225 @@ go install github.com/marshalldavidson61-arch/bindboss@latest
 Pack a directory into a self-extracting binary.
 
 ```sh
-# Basic — no dep check
 bindboss pack ./myapp myapp --run="python main.py"
-
-# With a required runtime
 bindboss pack ./grugbot grugbot \
-  --run="julia main.jl" \
-  --needs="julia,julia --version,https://julialang.org/downloads/"
-
-# Multiple deps
+    --run="julia main.jl" \
+    --needs="julia,julia --version,https://julialang.org/downloads/"
 bindboss pack ./webapp webapp \
-  --run="bun run index.ts" \
-  --needs="bun,bun --version,https://bun.sh" \
-  --needs="git,git --version,https://git-scm.com/downloads"
-
-# Cross-compile for Linux ARM
-bindboss pack ./myapp myapp-arm --run="./myapp" --target=linux/arm64
-
-# Keep extracted dir between runs (faster for large runtimes like Julia)
-bindboss pack ./grugbot grugbot --run="julia main.jl" --persist
+    --run="bun run index.ts" \
+    --needs="bun,bun --version,https://bun.sh" \
+    --persist
+bindboss pack ./app app --run="./app" --sign=~/.bindboss/keys/mykey.key
 ```
 
-**Flags:**
+Flags:
 
 | Flag | Description |
 |------|-------------|
-| `--run="cmd"` | Command to run inside the extracted directory |
-| `--needs="name,checkCmd,url"` | Runtime dep to check on first run. Repeatable. |
-| `--needs="name,checkCmd,url,message"` | Same with an optional note shown to the user |
-| `--persist` | Extract once to `~/.bindboss/<name>/`, reuse on subsequent runs |
-| `--target=GOOS/GOARCH` | Cross-compile target (e.g. `linux/amd64`, `darwin/arm64`) |
-| `--dir="/path"` | Override extract directory |
-
----
+| `--run="cmd"` | Command to run inside the extracted directory (required unless in bindboss.toml) |
+| `--needs="name,checkCmd,url"` | Dependency to check on first run. Repeatable. |
+| `--persist` | Extract to a fixed directory and reuse on subsequent runs |
+| `--dir="path"` | Override extract root directory |
+| `--target="GOOS/GOARCH"` | Cross-compile target (e.g. `linux/amd64`, `darwin/arm64`) |
+| `--sign="path/to/key.key"` | Sign the payload with an Ed25519 private key |
 
 ### `bindboss inspect <binary> [--list]`
 
-Print the config embedded in a packed binary.
+Print the embedded configuration, hash, and signature status of a packed binary.
 
 ```sh
-bindboss inspect ./grugbot
-bindboss inspect ./grugbot --list   # also list all packed files
+bindboss inspect ./myapp
+bindboss inspect ./myapp --list    # also list all packed files
 ```
 
----
+Output includes: run command, exec_mode, format version, SHA-256 hash, signed status, deps, hooks.
+
+### `bindboss verify <binary> [--pubkey=path]`
+
+Verify the payload hash and optionally the Ed25519 signature.
+
+```sh
+bindboss verify ./myapp
+bindboss verify ./myapp --pubkey=~/.bindboss/keys/mykey.pub
+```
+
+Returns exit 0 on success, exit 1 + FATAL message on any failure.
+
+### `bindboss keygen <name> [--keydir=path]`
+
+Generate an Ed25519 keypair for payload signing.
+
+```sh
+bindboss keygen myproject
+bindboss keygen myproject --keydir=/path/to/keys
+```
+
+Creates `<name>.key` (private, mode 0600) and `<name>.pub` (public) in `~/.bindboss/keys/` by default.
 
 ### `bindboss reset <name>`
 
-Delete the first-run state so the next run re-checks dependencies.
+Delete the first-run state for a binary, triggering dep re-check on next run.
 
 ```sh
-bindboss reset grugbot
+bindboss reset myapp
 ```
-
-Useful after a fresh OS install, after updating a runtime, or to verify the dep check still works.
 
 ---
 
-## Config file: `bindboss.toml`
+## `bindboss.toml` — Config File
 
-Drop a `bindboss.toml` in your directory as an alternative to CLI flags. CLI flags always override the config file.
+Place a `bindboss.toml` in your source directory. CLI flags always override it.
 
 ```toml
-name = "grugbot"
+name = "myapp"
 run  = "julia main.jl"
-env  = ["JULIA_NUM_THREADS=auto", "JULIA_DEPOT_PATH=.julia"]
+exec_mode = "exec"   # "exec" (default) or "fork" — see below
+
+env = [
+    "MY_VAR=hello",
+    "OTHER=world",
+]
 
 [[needs]]
 name    = "julia"
 check   = "julia --version"
 url     = "https://julialang.org/downloads/"
-message = "Julia 1.9+ required"
-
-[[needs]]
-name  = "git"
-check = "git --version"
-url   = "https://git-scm.com/downloads"
+message = "Install Julia 1.9+ and restart your terminal"
 
 [extract]
-persist = false   # true = reuse extracted dir between runs
-cleanup = true    # remove tmpdir on exit (ignored when persist=true)
+persist = false
+cleanup = true
+dir     = ""
+
+[hooks]
+pre_run  = ["sh -c 'echo starting up'", "chmod 755 setup.sh && ./setup.sh"]
+post_run = ["sh -c 'echo done'"]  # only fires with exec_mode = "fork" on Unix
+```
+
+### `exec_mode`
+
+| Value | Behavior |
+|-------|----------|
+| `"exec"` (default) | Unix `syscall.Exec` — replaces the stub process entirely. Same PID, clean signal handling, no wrapper. **post_run hooks cannot fire.** |
+| `"fork"` | `os/exec.Cmd.Run()` — stub stays alive. post_run hooks fire. Cleanup runs. Costs a wrapper process. |
+
+Windows always uses the fork path.
+
+### `--needs` flag format
+
+```
+"name,checkCmd,url"
+"name,checkCmd,url,optional message"
+```
+
+The check command's **exit code** determines presence — `0` = found, non-zero = missing. No version parsing.
+
+On first run, if a dep is missing: open the URL in the browser, print the message, and wait for the user to press Enter. Re-check. Repeat until all deps are found. State is saved to `~/.bindboss/<name>.state` so the check only happens once.
+
+---
+
+## Integrity: Hash + Signature
+
+Every packed binary (v2 format) includes a SHA-256 hash of the payload bytes in the trailer. This enables:
+
+- **Tamper detection**: `bindboss verify` re-computes the hash from disk and compares it
+- **Corruption detection**: bit-flipped payloads are caught before extraction
+- **Runtime verification**: set `BINDBOSS_VERIFY=1` before running to verify hash on every exec
+
+Optional Ed25519 signing:
+
+```sh
+bindboss keygen myproject                    # generate keypair once
+bindboss pack ./app app --sign=myproject.key # sign at pack time
+bindboss verify ./app --pubkey=myproject.pub # verify anytime
+```
+
+The signature is over the SHA-256 hash of the payload (not the raw bytes), stored in the 121-byte v2 trailer.
+
+---
+
+## Hooks
+
+```toml
+[hooks]
+pre_run  = ["sh -c 'mkdir -p data'", "chmod 755 run.sh"]
+post_run = ["sh -c 'rm -rf /tmp/scratch'"]
+```
+
+- Hooks run in order. First failure stops execution — no silent partial runs.
+- `BINDBOSS_EXTRACT_DIR` and `BINDBOSS_BINARY_NAME` are injected into hook env.
+- No shell expansion — use `sh -c '...'` if you need shell features.
+- `post_run` only fires on Windows or when `exec_mode = "fork"`.
+
+---
+
+## Library API
+
+Use bindboss programmatically in your Go projects:
+
+```go
+import bb "github.com/marshalldavidson61-arch/bindboss/pkg/bindboss"
+
+// Pack a directory
+err := bb.Pack(bb.PackOptions{
+    SrcDir:  "./myapp",
+    OutPath: "./myapp-bin",
+    Run:     "julia main.jl",
+    Needs: []bb.Dep{{
+        Name:  "julia",
+        Check: "julia --version",
+        URL:   "https://julialang.org/downloads/",
+    }},
+})
+
+// Inspect a packed binary
+info, err := bb.Inspect("./myapp-bin")
+fmt.Println(info.Run, info.Hash, info.SigPresent)
+
+// Verify hash (and optionally signature)
+err = bb.Verify("./myapp-bin", nil)             // hash only
+err = bb.Verify("./myapp-bin", pubKey)          // hash + sig
+
+// Generate a keypair
+priv, pub, err := bb.GenerateKey("", "myproject")
+
+// Load keys
+priv, err = bb.LoadPrivateKey("myproject.key")
+pub,  err = bb.LoadPublicKey("myproject.pub")
+
+// Pack with signing
+err = bb.Pack(bb.PackOptions{
+    SrcDir:  "./myapp",
+    OutPath: "./myapp-bin",
+    Run:     "julia main.jl",
+    PrivKey: priv,
+})
 ```
 
 ---
 
-## First-run dep check
-
-When a dep is missing, the user sees:
+## Binary Format
 
 ```
-[bindboss] first run — checking dependencies...
-[bindboss] dependency missing: julia
-[bindboss] Julia 1.9+ required
-[bindboss] install URL: https://julialang.org/downloads/
-[bindboss] press Enter after installing julia (Ctrl+C to abort)...
-> [user installs Julia, presses Enter]
-[bindboss] julia found ✓
-[bindboss] starting grugbot...
-Hello from grugbot!
+[stub ELF/Mach-O/PE]  ← valid executable, OS loads normally
+[tar.gz payload]       ← the packed directory
+[8b: payload offset]   ← big-endian uint64, where tar.gz starts
+[32b: SHA-256 hash]    ← hash of tar.gz bytes
+[64b: Ed25519 sig]     ← signature over hash, or zeros if unsigned
+[1b: flags]            ← bit 0: hash present, bit 1: sig present
+[16b: magic v2]        ← 0xBD055B0B1CEB055C...
 ```
 
-After that, `~/.bindboss/grugbot.state` is written. Future runs go straight to execution — no dep check, no delay.
+Total trailer: 121 bytes. Located by seeking to `EOF - 121`.
+
+Legacy v1 format (24-byte trailer, no hash/sig) is detected and read transparently. New stubs warn and run anyway; new binaries always write v2.
 
 ---
 
-## How it works
+## Design Philosophy
 
-```
-┌─────────────────────────────────────────────────────┐
-│                output binary                        │
-│                                                     │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────┐  │
-│  │  stub ELF   │  │  tar.gz of   │  │  trailer  │  │
-│  │  (runner)   │  │  your dir    │  │  8b+16b   │  │
-│  └─────────────┘  └──────────────┘  └───────────┘  │
-│                                           ↑         │
-│                              magic + payload offset │
-└─────────────────────────────────────────────────────┘
-```
-
-The OS loads and executes the stub ELF (the loader only reads ELF headers at the front). The stub seeks to the last 24 bytes, finds the magic marker and payload offset, seeks to the tar.gz, extracts it, and execs your run command. The extracted directory becomes the working directory.
-
-On Unix, `syscall.Exec` replaces the stub process entirely with your command — no wrapper overhead, clean signal handling, correct PID.
-
----
-
-## Design philosophy
-
-- **No silent failures.** Every error is printed with context. Nothing swallowed.
-- **No magic runtimes.** `bindboss` itself is a single static Go binary with zero runtime dependencies.
-- **No lock-in.** Works for Julia, Python, Bun, Node, Rust, shell scripts, anything.
-- **No install ceremony.** The dep check is user-driven, human-readable, and runs exactly once.
-- **Cross-platform.** `--target=linux/arm64`, `darwin/amd64`, `windows/amd64`, etc.
-
----
-
-## Requirements
-
-- Go 1.23+ to build `bindboss` itself
-- The packed binary has no requirements — it's statically compiled (CGO_ENABLED=0)
-
----
-
-## License
-
-MIT
+- **Error-first**: every failure path returns a descriptive `!!! FATAL:` error. Nothing silent.
+- **No runtime deps**: packed binaries are statically compiled. No libc, no framework.
+- **One command**: `bindboss pack dir out --run="cmd"` is the entire workflow.
+- **Integrity by default**: hash is always computed and stored. You don't opt in to knowing if your binary is intact.
+- **Grug-style internals**: simple data structures, no clever abstractions, comments explain why not just what.
