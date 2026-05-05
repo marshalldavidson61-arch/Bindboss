@@ -24,6 +24,13 @@
 // multi-step installer. The wizard config can be inlined as a JSON string
 // or referenced as a file path relative to the packed directory.
 //
+// The [update] section enables remote update checking from a Git repository.
+// The stub queries the GitHub API for the latest commit on the configured
+// branch. If the commit SHA differs from the one stored in the state file,
+// the stub downloads the latest archive zip and re-extracts. This provides
+// automatic updates without repacking — the binary acts as a thin launcher
+// that always runs the latest version from the remote repo.
+//
 // The [hooks] section uses a declarative array-of-strings model rather than
 // a scripting language. Each string is parsed as argv (no shell expansion)
 // by hooks.splitCmd. This keeps the config readable and the execution surface
@@ -81,6 +88,26 @@ type Install struct {
 	ConfigFile   string `toml:"install_file"`   // path to install.json relative to packed dir
 }
 
+// Update configures remote update checking from a Git repository.
+// When present, the stub checks the repo for new commits on every run.
+// If the remote has new commits since the last run, the stub downloads
+// the latest archive and re-extracts into the persist directory.
+//
+// GRUG: update URL = where grug checks for new stuff. if remote has new
+// commits, grug downloads fresh zip and replaces old files. simple.
+// no update URL = no checking. binary stays as packed forever. fine too.
+//
+// GRUG: update requires persist mode. without persist, every run extracts
+// fresh from the embedded payload anyway — update check is pointless.
+// if you set update URL without persist, grug auto-enables persist and warns.
+//
+// GRUG: right now grug only speaks GitHub. URL must be https://github.com/owner/repo.
+// other git hosts = future work. one host, done right, then extend.
+type Update struct {
+	URL    string `toml:"url"`    // GitHub repo URL, e.g. "https://github.com/owner/repo"
+	Branch string `toml:"branch"` // branch to track. empty = "main"
+}
+
 // Config is the full picture for one packed binary.
 type Config struct {
 	Name     string  `toml:"name"`      // display name — used in logs and state file path
@@ -91,6 +118,7 @@ type Config struct {
 	Extract  Extract `toml:"extract"`
 	Hooks    Hooks   `toml:"hooks"`
 	Install  Install `toml:"install"` // optional install wizard GUI config
+	Update   Update  `toml:"update"`  // optional remote update checker config
 }
 
 // DefaultConfig returns safe starting values.
@@ -169,6 +197,19 @@ func MergeFlags(cfg Config, name, run string, needs []string, persist bool, dir 
 	return cfg, nil
 }
 
+// MergeUpdateFlags overlays update-related CLI values onto cfg.
+// GRUG: separate from MergeFlags because update has its own --update flag.
+// empty string = not provided = keep toml value. flag always wins.
+func MergeUpdateFlags(cfg Config, updateURL, updateBranch string) Config {
+	if updateURL != "" {
+		cfg.Update.URL = updateURL
+	}
+	if updateBranch != "" {
+		cfg.Update.Branch = updateBranch
+	}
+	return cfg
+}
+
 // ParseDepFlag parses one --needs flag value.
 // Format: "name,checkCmd,url" or "name,checkCmd,url,message"
 // Fewer than 3 fields = FATAL. Empty name/check/url = FATAL.
@@ -203,12 +244,47 @@ func ParseDepFlag(raw string) (Dep, error) {
 	return d, nil
 }
 
+// ParseUpdateURL validates a GitHub repo URL.
+// Must be https://github.com/owner/repo format.
+// Returns the URL as-is if valid, or a FATAL error.
+//
+// GRUG: grug only speaks GitHub. URL must look like a GitHub repo.
+// no git:// no ssh:// no bitbucket. just https://github.com/owner/repo.
+// trailing slash = fine. .git suffix = fine. grug strips both.
+func ParseUpdateURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil // GRUG: empty = no update. not an error.
+	}
+
+	// GRUG: strip trailing slash and .git suffix. normalize for API calls.
+	raw = strings.TrimSuffix(raw, "/")
+	raw = strings.TrimSuffix(raw, ".git")
+
+	if !strings.HasPrefix(raw, "https://github.com/") {
+		return "", fmt.Errorf(
+			"!!! FATAL: --update URL must be a GitHub repo (https://github.com/owner/repo), got %q",
+			raw)
+	}
+
+	// GRUG: must have exactly owner/repo after the prefix.
+	path := strings.TrimPrefix(raw, "https://github.com/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", fmt.Errorf(
+			"!!! FATAL: --update URL must be https://github.com/owner/repo, got %q", raw)
+	}
+
+	return raw, nil
+}
+
 // Validate checks config is complete enough to run.
 // Empty run command = FATAL. Bad exec_mode = FATAL.
-func Validate(cfg Config) error {
+// Update without persist = auto-enable persist and warn.
+func Validate(cfg Config) (Config, error) {
 	if strings.TrimSpace(cfg.Run) == "" {
-		return fmt.Errorf(
-			"!!! FATAL: no run command specified — " +
+		return cfg, fmt.Errorf(
+			"!!! FATAL: no run command specified — "+
 				"set 'run' in bindboss.toml or pass --run=\"cmd\"")
 	}
 
@@ -216,19 +292,18 @@ func Validate(cfg Config) error {
 	case "", "exec", "fork":
 		// GRUG: empty string treated as "exec" (default). fine.
 	default:
-		return fmt.Errorf(
+		return cfg, fmt.Errorf(
 			"!!! FATAL: invalid exec_mode %q — must be \"exec\" or \"fork\"", cfg.ExecMode)
 	}
 
-	return nil
-}
-
-// ToTOML serializes Config to TOML bytes for embedding in the archive.
-func ToTOML(cfg Config) ([]byte, error) {
-	var sb strings.Builder
-	enc := toml.NewEncoder(&sb)
-	if err := enc.Encode(cfg); err != nil {
-		return nil, fmt.Errorf("!!! FATAL: cannot serialize config to TOML: %w", err)
+	// GRUG: update URL set but persist not enabled = pointless. auto-fix it.
+	// without persist, every run extracts from embedded payload and update
+	// check can never take effect. warn loudly so user knows.
+	if cfg.Update.URL != "" && !cfg.Extract.Persist {
+		fmt.Fprintf(os.Stderr,
+			"[bindboss] warning: --update requires --persist — auto-enabling persist mode\n")
+		cfg.Extract.Persist = true
 	}
-	return []byte(sb.String()), nil
+
+	return cfg, nil
 }

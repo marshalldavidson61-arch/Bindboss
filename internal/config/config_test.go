@@ -221,7 +221,7 @@ func TestParseDepFlagInvalid(t *testing.T) {
 // TestValidateEmptyRunFails verifies that a config without a run command fails.
 func TestValidateEmptyRunFails(t *testing.T) {
 	cfg := config.Config{Run: ""}
-	err := config.Validate(cfg)
+	_, err := config.Validate(cfg)
 	if err == nil {
 		t.Fatal("Validate should fail on empty run command")
 	}
@@ -233,7 +233,7 @@ func TestValidateEmptyRunFails(t *testing.T) {
 // TestValidateWithRunSucceeds verifies that a config with a run command passes.
 func TestValidateWithRunSucceeds(t *testing.T) {
 	cfg := config.Config{Run: "julia main.jl"}
-	if err := config.Validate(cfg); err != nil {
+	if _, err := config.Validate(cfg); err != nil {
 		t.Errorf("Validate should succeed with run command, got: %v", err)
 	}
 }
@@ -355,5 +355,218 @@ run  = "sh run.sh"
 	}
 	if cfg.Install.ConfigFile != "" {
 		t.Error("Install.ConfigFile should be empty")
+	}
+}
+
+// TestLoadUpdateConfig verifies loading the [update] section from TOML.
+func TestLoadUpdateConfig(t *testing.T) {
+	dir := t.TempDir()
+	tomlContent := `
+name = "updateme"
+run  = "python main.py"
+
+[update]
+url = "https://github.com/owner/repo"
+branch = "develop"
+`
+	if err := os.WriteFile(filepath.Join(dir, "bindboss.toml"), []byte(tomlContent), 0644); err != nil {
+		t.Fatalf("write toml: %v", err)
+	}
+
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.Update.URL != "https://github.com/owner/repo" {
+		t.Errorf("Update.URL: got %q, want %q", cfg.Update.URL, "https://github.com/owner/repo")
+	}
+	if cfg.Update.Branch != "develop" {
+		t.Errorf("Update.Branch: got %q, want %q", cfg.Update.Branch, "develop")
+	}
+}
+
+// TestLoadNoUpdateSection verifies backward compat — no [update] = zero values.
+func TestLoadNoUpdateSection(t *testing.T) {
+	dir := t.TempDir()
+	tomlContent := `
+name = "plainapp"
+run  = "sh run.sh"
+`
+	if err := os.WriteFile(filepath.Join(dir, "bindboss.toml"), []byte(tomlContent), 0644); err != nil {
+		t.Fatalf("write toml: %v", err)
+	}
+
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.Update.URL != "" {
+		t.Errorf("Update.URL should be empty, got %q", cfg.Update.URL)
+	}
+	if cfg.Update.Branch != "" {
+		t.Errorf("Update.Branch should be empty, got %q", cfg.Update.Branch)
+	}
+}
+
+// TestValidateAutoEnablesPersist verifies that Validate auto-enables persist
+// when an update URL is set without persist.
+func TestValidateAutoEnablesPersist(t *testing.T) {
+	cfg := config.Config{
+		Run: "python main.py",
+		Update: config.Update{
+			URL: "https://github.com/owner/repo",
+		},
+		// Extract.Persist is false by default
+	}
+
+	validated, err := config.Validate(cfg)
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	if !validated.Extract.Persist {
+		t.Error("Validate should auto-enable persist when update URL is set")
+	}
+}
+
+// TestValidatePersistAlreadySet verifies that Validate doesn't touch persist
+// when it's already enabled.
+func TestValidatePersistAlreadySet(t *testing.T) {
+	cfg := config.Config{
+		Run: "python main.py",
+		Extract: config.Extract{
+			Persist: true,
+		},
+		Update: config.Update{
+			URL: "https://github.com/owner/repo",
+		},
+	}
+
+	validated, err := config.Validate(cfg)
+	if err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+
+	if !validated.Extract.Persist {
+		t.Error("Validate should keep persist enabled")
+	}
+}
+
+// TestParseUpdateURLValid verifies valid GitHub URL parsing.
+func TestParseUpdateURLValid(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"https://github.com/owner/repo", "https://github.com/owner/repo"},
+		{"https://github.com/owner/repo.git", "https://github.com/owner/repo"},
+		{"https://github.com/owner/repo/", "https://github.com/owner/repo"},
+		{"  https://github.com/owner/repo  ", "https://github.com/owner/repo"},
+	}
+
+	for _, tt := range tests {
+		got, err := config.ParseUpdateURL(tt.input)
+		if err != nil {
+			t.Errorf("ParseUpdateURL(%q): unexpected error: %v", tt.input, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("ParseUpdateURL(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+// TestParseUpdateURLInvalid verifies that non-GitHub URLs are rejected.
+func TestParseUpdateURLInvalid(t *testing.T) {
+	tests := []string{
+		"https://gitlab.com/owner/repo",
+		"https://bitbucket.org/owner/repo",
+		"git@github.com:owner/repo",
+		"https://github.com/only-one-part",
+		"https://github.com//repo",
+	}
+
+	for _, input := range tests {
+		_, err := config.ParseUpdateURL(input)
+		if err == nil {
+			t.Errorf("ParseUpdateURL(%q): expected error, got none", input)
+		}
+	}
+}
+
+// TestParseUpdateURLEmpty verifies that empty string is OK (no update).
+func TestParseUpdateURLEmpty(t *testing.T) {
+	got, err := config.ParseUpdateURL("")
+	if err != nil {
+		t.Errorf("ParseUpdateURL empty: unexpected error: %v", err)
+	}
+	if got != "" {
+		t.Errorf("ParseUpdateURL empty: got %q, want empty", got)
+	}
+}
+
+// TestMergeUpdateFlags verifies that CLI flags override config values.
+func TestMergeUpdateFlags(t *testing.T) {
+	cfg := config.Config{Run: "test"}
+
+	// Merge with flags
+	cfg = config.MergeUpdateFlags(cfg, "https://github.com/new/repo", "develop")
+
+	if cfg.Update.URL != "https://github.com/new/repo" {
+		t.Errorf("Update.URL: got %q, want %q", cfg.Update.URL, "https://github.com/new/repo")
+	}
+	if cfg.Update.Branch != "develop" {
+		t.Errorf("Update.Branch: got %q, want %q", cfg.Update.Branch, "develop")
+	}
+}
+
+// TestMergeUpdateFlagsEmptyKeepsConfig verifies that empty flags preserve config.
+func TestMergeUpdateFlagsEmptyKeepsConfig(t *testing.T) {
+	cfg := config.Config{
+		Run: "test",
+		Update: config.Update{
+			URL:    "https://github.com/existing/repo",
+			Branch: "main",
+		},
+	}
+
+	cfg = config.MergeUpdateFlags(cfg, "", "")
+
+	if cfg.Update.URL != "https://github.com/existing/repo" {
+		t.Errorf("Update.URL should be preserved, got %q", cfg.Update.URL)
+	}
+	if cfg.Update.Branch != "main" {
+		t.Errorf("Update.Branch should be preserved, got %q", cfg.Update.Branch)
+	}
+}
+
+// TestToTOMLWithUpdate verifies that ToTOML includes the [update] section.
+func TestToTOMLWithUpdate(t *testing.T) {
+	orig := config.Config{
+		Name: "updateme",
+		Run:  "python main.py",
+		Update: config.Update{
+			URL:    "https://github.com/owner/repo",
+			Branch: "develop",
+		},
+	}
+
+	data, err := config.ToTOML(orig)
+	if err != nil {
+		t.Fatalf("ToTOML: %v", err)
+	}
+
+	roundtripped, err := config.LoadFromBytes(data)
+	if err != nil {
+		t.Fatalf("LoadFromBytes: %v", err)
+	}
+
+	if roundtripped.Update.URL != orig.Update.URL {
+		t.Errorf("Update.URL: got %q, want %q", roundtripped.Update.URL, orig.Update.URL)
+	}
+	if roundtripped.Update.Branch != orig.Update.Branch {
+		t.Errorf("Update.Branch: got %q, want %q", roundtripped.Update.Branch, orig.Update.Branch)
 	}
 }

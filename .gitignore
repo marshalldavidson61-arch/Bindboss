@@ -7,4 +7,4 @@ hello-tampered
 hello-with-deps
 ci-hello
 *.exe
-testdata/ci-hello/
+testdata/ci-hello/TODO_REVIEW.md

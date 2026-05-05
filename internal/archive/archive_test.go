@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"archive/tar"
+	"compress/gzip"
 	"testing"
 )
 
@@ -378,4 +380,81 @@ func TestHashPayloadConsistency(t *testing.T) {
 
 	_ = sha256.New() // ensure import is used
 	_ = fmt.Sprintf // ensure fmt is used
+}
+// TestReadFileFromTarGz verifies reading a single file from a tar.gz archive.
+func TestReadFileFromTarGz(t *testing.T) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+
+	// Add a few files
+	files := map[string]string{
+		"bindboss.toml": "name = \"test\"\nrun = \"./app\"\n",
+		"src/main.jl":   "println(\"hello\")\n",
+		"README.md":     "# Test\n",
+	}
+
+	for name, content := range files {
+		hdr := &tar.Header{
+			Name: name,
+			Mode: 0644,
+			Size: int64(len(content)),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("WriteHeader %q: %v", name, err)
+		}
+		if _, err := tw.Write([]byte(content)); err != nil {
+			t.Fatalf("Write %q: %v", name, err)
+		}
+	}
+	tw.Close()
+	gw.Close()
+
+	// Read bindboss.toml
+	data, err := ReadFileFromTarGz(bytes.NewReader(buf.Bytes()), "bindboss.toml")
+	if err != nil {
+		t.Fatalf("ReadFileFromTarGz: %v", err)
+	}
+	if string(data) != files["bindboss.toml"] {
+		t.Errorf("got %q, want %q", string(data), files["bindboss.toml"])
+	}
+}
+
+// TestReadFileFromTarGzNotFound verifies error when file doesn't exist.
+func TestReadFileFromTarGzNotFound(t *testing.T) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	hdr := &tar.Header{Name: "other.txt", Mode: 0644, Size: 5}
+	tw.WriteHeader(hdr)
+	tw.Write([]byte("hello"))
+	tw.Close()
+	gw.Close()
+
+	_, err := ReadFileFromTarGz(bytes.NewReader(buf.Bytes()), "bindboss.toml")
+	if err == nil {
+		t.Error("expected error for missing file, got none")
+	}
+}
+
+// TestReadFileFromTarGzWithDotSlash verifies path normalization with ./ prefix.
+func TestReadFileFromTarGzWithDotSlash(t *testing.T) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+
+	content := "name = \"dotslash\"\n"
+	hdr := &tar.Header{Name: "./bindboss.toml", Mode: 0644, Size: int64(len(content))}
+	tw.WriteHeader(hdr)
+	tw.Write([]byte(content))
+	tw.Close()
+	gw.Close()
+
+	data, err := ReadFileFromTarGz(bytes.NewReader(buf.Bytes()), "bindboss.toml")
+	if err != nil {
+		t.Fatalf("ReadFileFromTarGz with ./ prefix: %v", err)
+	}
+	if string(data) != content {
+		t.Errorf("got %q, want %q", string(data), content)
+	}
 }

@@ -183,6 +183,14 @@ func (c *InspectCmd) Run(args []string) error {
 		fmt.Printf("dir:       %s\n", cfg.Extract.Dir)
 	}
 
+	if cfg.Update.URL != "" {
+		fmt.Printf("update:    %s", cfg.Update.URL)
+		if cfg.Update.Branch != "" {
+			fmt.Printf(" (branch: %s)", cfg.Update.Branch)
+		}
+		fmt.Println()
+	}
+
 	// ------------------------------------------------------------------
 	// File listing (--list only)
 	// ------------------------------------------------------------------

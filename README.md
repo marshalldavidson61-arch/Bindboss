@@ -48,6 +48,9 @@ bindboss pack ./webapp webapp \
     --needs="bun,bun --version,https://bun.sh" \
     --persist
 bindboss pack ./app app --run="./app" --sign=~/.bindboss/keys/mykey.key
+bindboss pack ./launcher launcher \
+    --run="sh start.sh" \
+    --update=https://github.com/myorg/myapp
 ```
 
 Flags:
@@ -60,6 +63,8 @@ Flags:
 | `--dir="path"` | Override extract root directory |
 | `--target="GOOS/GOARCH"` | Cross-compile target (e.g. `linux/amd64`, `darwin/arm64`) |
 | `--sign="path/to/key.key"` | Sign the payload with an Ed25519 private key |
+| `--update="https://github.com/owner/repo"` | Enable remote update checking from a GitHub repo. Auto-enables `--persist`. |
+| `--update-branch="main"` | Branch to track for updates (default: `main`) |
 
 ### `bindboss inspect <binary> [--list]`
 
@@ -132,6 +137,10 @@ dir     = ""
 [hooks]
 pre_run  = ["sh -c 'echo starting up'", "chmod 755 setup.sh && ./setup.sh"]
 post_run = ["sh -c 'echo done'"]  # only fires with exec_mode = "fork" on Unix
+
+[update]
+url    = "https://github.com/myorg/myapp"   # optional: remote update source
+branch = "main"                              # branch to track (default: main)
 ```
 
 ### `exec_mode`
@@ -153,6 +162,109 @@ Windows always uses the fork path.
 The check command's **exit code** determines presence — `0` = found, non-zero = missing. No version parsing.
 
 On first run, if a dep is missing: open the URL in the browser, print the message, and wait for the user to press Enter. Re-check. Repeat until all deps are found. State is saved to `~/.bindboss/<name>.state` so the check only happens once.
+
+---
+
+## Remote Updates
+
+Bindboss can turn a packed binary into a thin launcher that pulls its application
+code from a GitHub repository on every run. The binary checks the remote repo for
+new commits, downloads the latest zip archive if there are any, and extracts it
+into the persist directory before executing the `run` command.
+
+**KISS by design:** GitHub only, public repos only, no auth required, no version
+tags — just "is there a newer commit on this branch than the one I have cached?"
+
+### Enabling updates
+
+```sh
+bindboss pack ./launcher mybin \
+    --run="sh start.sh" \
+    --update=https://github.com/myorg/myapp \
+    --update-branch=main      # optional; defaults to "main"
+```
+
+Or in `bindboss.toml`:
+
+```toml
+[update]
+url    = "https://github.com/myorg/myapp"
+branch = "main"
+```
+
+### How it works
+
+1. On every run, if the throttle window (5 minutes) has elapsed, the stub calls
+   `GET https://api.github.com/repos/{owner}/{repo}/commits/{branch}` and compares
+   the returned SHA to the one saved in the state file.
+2. If SHAs match → nothing to do, run the cached copy.
+3. If SHAs differ → download the branch zip archive
+   (`https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.zip`), verify
+   it's a valid zip, wipe the persist directory, and extract the new contents.
+4. The packed `bindboss.toml` is preserved across updates so the binary's run
+   configuration survives. If the remote repo ships its own `bindboss.toml`, it
+   overrides the packed one (power-user opt-in).
+5. Dependency state is reset after an update so the dep check re-runs in case
+   the new version needs new tools.
+
+### Auto-persist
+
+`--update` requires `--persist` because non-persist mode extracts fresh from the
+embedded payload on every run, which would make the update check pointless.
+Bindboss auto-enables `--persist` when `--update` is set and prints a warning.
+
+### Throttling and rate limits
+
+The GitHub REST API allows 60 unauthenticated requests per hour per IP. To stay
+well under that, Bindboss only checks once per 5-minute window. The last check
+time is stored in `~/.bindboss/<name>.state` (`update_checked_at`) and the last
+seen SHA is stored as `update_commit_sha`.
+
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `BINDBOSS_SKIP_UPDATE=1` | Skip the update check entirely and run the cached copy. Useful offline, in CI, or when GitHub is having a bad day. Ignored on first-run (nothing to fall back to). |
+| `BINDBOSS_VERIFY=1` | Re-hash the embedded payload before extraction. Independent of updates. |
+
+### Graceful offline behavior
+
+If the update check fails (DNS failure, network timeout, GitHub 5xx, rate limit,
+etc.) and a cached copy exists, Bindboss prints a warning and continues with the
+cached version. Only the **first run** (where there is literally no cached copy
+to execute) treats an update failure as fatal.
+
+```
+[bindboss] warning: update check failed (...) — running cached version abc1234
+```
+
+### Inspecting update state
+
+`bindboss inspect` shows whether a binary has update checking enabled:
+
+```
+$ bindboss inspect mybin
+binary:    mybin
+name:      myapp
+run:       sh start.sh
+exec_mode: exec
+format:    v2
+hash:      07d179d0...
+signed:    no
+deps:      (none)
+persist:   true
+update:    https://github.com/myorg/myapp
+```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `cannot open run.sh: No such file` after update | Remote repo doesn't contain `run.sh` | Make sure the files your `run` command references are committed to the remote repo |
+| `first-run update failed and no cached copy exists` | No network on first run | Run once with network, then `BINDBOSS_SKIP_UPDATE=1` works offline |
+| Updates never happen | Throttle window, or same commit | `rm ~/.bindboss/<name>.state` to force re-check |
+| `GitHub API returned 403` | Rate limited | Wait 1 hour, or use throttle (default 5min already) |
+| `GitHub API returned 404` | Bad owner/repo/branch or private repo | Public repos only. Double-check the URL. |
 
 ---
 
@@ -231,6 +343,15 @@ err = bb.Pack(bb.PackOptions{
     OutPath: "./myapp-bin",
     Run:     "julia main.jl",
     PrivKey: priv,
+})
+
+// Pack with remote update checking (auto-enables persist)
+err = bb.Pack(bb.PackOptions{
+    SrcDir:       "./launcher",
+    OutPath:      "./mybin",
+    Run:          "sh start.sh",
+    UpdateURL:    "https://github.com/myorg/myapp",
+    UpdateBranch: "main", // optional; defaults to "main"
 })
 ```
 

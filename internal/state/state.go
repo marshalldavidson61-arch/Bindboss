@@ -48,6 +48,12 @@ type State struct {
 	Checked bool
 	// CheckedAt: unix timestamp of when the check last passed.
 	CheckedAt int64
+	// UpdateCommitSHA: the latest commit SHA seen from the remote update repo.
+	// Empty = never checked or no update config. Used by stub to detect new commits.
+	UpdateCommitSHA string
+	// UpdateCheckedAt: unix timestamp of the last successful update check.
+	// Used to throttle checks (not every run needs a GitHub API call).
+	UpdateCheckedAt int64
 }
 
 // stateDir returns the ~/.bindboss/ directory, creating it if needed.
@@ -161,9 +167,23 @@ func MarkChecked(name string) error {
 	})
 }
 
+// MarkUpdateChecked loads the current state, updates the update-related fields,
+// and saves it back. This preserves the Checked/CheckedAt fields.
+// GRUG: update check and dep check are separate. don'''t nuke dep state when
+// writing update state. load, patch, save. simple.
+func MarkUpdateChecked(name string, commitSHA string) error {
+	s, err := Load(name)
+	if err != nil {
+		return err
+	}
+	s.UpdateCommitSHA = commitSHA
+	s.UpdateCheckedAt = time.Now().Unix()
+	return Save(name, s)
+}
+
 // serialize converts a State to the simple key=value text format.
 func serialize(s State) string {
-	return fmt.Sprintf("checked=%v\nchecked_at=%d\n", s.Checked, s.CheckedAt)
+	return fmt.Sprintf("checked=%v\nchecked_at=%d\nupdate_commit_sha=%s\nupdate_checked_at=%d\n", s.Checked, s.CheckedAt, s.UpdateCommitSHA, s.UpdateCheckedAt)
 }
 
 // parse reads the simple key=value text format back into a State.
@@ -193,6 +213,14 @@ func parse(data []byte) (State, error) {
 				return State{}, fmt.Errorf("!!! FATAL: invalid 'checked_at' value in state file: %q", v)
 			}
 			s.CheckedAt = n
+		case "update_commit_sha":
+			s.UpdateCommitSHA = v
+		case "update_checked_at":
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return State{}, fmt.Errorf("!!! FATAL: invalid 'update_checked_at' value in state file: %q", v)
+			}
+			s.UpdateCheckedAt = n
 		// GRUG: unknown keys = ignore. forward-compat if we add fields later.
 		}
 	}

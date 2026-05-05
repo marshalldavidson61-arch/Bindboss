@@ -66,6 +66,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -77,9 +78,10 @@ import (
 	"github.com/marshalldavidson61-arch/bindboss/internal/archive"
 	"github.com/marshalldavidson61-arch/bindboss/internal/checker"
 	"github.com/marshalldavidson61-arch/bindboss/internal/config"
-	"github.com/marshalldavidson61-arch/bindboss/internal/installer"
 	"github.com/marshalldavidson61-arch/bindboss/internal/hooks"
+	"github.com/marshalldavidson61-arch/bindboss/internal/installer"
 	"github.com/marshalldavidson61-arch/bindboss/internal/state"
+	"github.com/marshalldavidson61-arch/bindboss/internal/updater"
 )
 
 func main() {
@@ -127,11 +129,21 @@ func main() {
 	}
 
 	// ------------------------------------------------------------------
-	// STEP 3: Determine extract directory
+	// STEP 3: Peek at config from archive to determine extract settings
+	// GRUG: need to know persist mode before we decide where to extract.
+	// chicken-and-egg: config is in the archive, but we need config to
+	// know where to extract. solution: peek at bindboss.toml from the
+	// tar.gz stream without extracting everything. fast and simple.
 	// ------------------------------------------------------------------
 	binaryName := filepath.Base(selfPath)
 
-	extractDir, cleanup, err := resolveExtractDir(binaryName)
+	peekCfg, err := peekConfigFromPayload(payloadInfo.Reader)
+	if err != nil {
+		fatalf("%v", err)
+	}
+
+	// GRUG: now we know persist mode. resolve the real extract directory.
+	extractDir, cleanup, err := resolveExtractDir(binaryName, peekCfg)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -151,6 +163,14 @@ func main() {
 	}
 
 	if needsExtract {
+		// GRUG: payloadInfo.Reader was consumed by peekConfigFromPayload.
+		// reopen the payload for full extraction. same as BINDBOSS_VERIFY path.
+		payloadInfo.Reader.Close()
+		payloadInfo, err = archive.FindPayload(selfPath)
+		if err != nil {
+			fatalf("%v", err)
+		}
+
 		if err := archive.Extract(payloadInfo.Reader, extractDir); err != nil {
 			fatalf("%v", err)
 		}
@@ -164,7 +184,8 @@ func main() {
 		fatalf("%v", err)
 	}
 
-	if err := config.Validate(cfg); err != nil {
+	cfg, err = config.Validate(cfg)
+	if err != nil {
 		fatalf("%v", err)
 	}
 
@@ -172,6 +193,95 @@ func main() {
 	// state file and logs use this name — should be human-readable.
 	if cfg.Name == "" {
 		cfg.Name = binaryName
+	}
+
+	// ------------------------------------------------------------------
+	// STEP 5.5: Remote update check (if configured)
+	// GRUG: if update URL is set in config, check GitHub for new commits.
+	// if remote has new stuff, download zip and extract into persist dir.
+	// this replaces old files with new ones. update = fresh install.
+	// no update URL = skip entirely. binary stays as packed forever.
+	// ------------------------------------------------------------------
+	// GRUG: BINDBOSS_SKIP_UPDATE=1 = user wants to run whatever is already
+	// on disk. useful offline, in CI, or when GitHub is having a bad day.
+	// honored ONLY if we already have a cached copy — first-run still needs
+	// to download the repo contents.
+	skipUpdate := os.Getenv("BINDBOSS_SKIP_UPDATE") == "1"
+
+	if cfg.Update.URL != "" && !skipUpdate {
+		st, err := state.Load(cfg.Name)
+		if err != nil {
+			fatalf("%v", err)
+		}
+
+		result, err := updater.CheckAndDownload(
+			cfg.Update.URL,
+			cfg.Update.Branch,
+			st.UpdateCommitSHA,
+			st.UpdateCheckedAt,
+			extractDir,
+		)
+		if err != nil {
+			// GRUG: update check failed (network down, GitHub 503, rate limit, etc).
+			// if we have a cached copy already, that's still runnable — warn and
+			// continue with the old version. only FATAL on first run where we
+			// have literally nothing to execute.
+			if st.UpdateCommitSHA == "" {
+				fatalf("first-run update failed and no cached copy exists: %v", err)
+			}
+			fmt.Fprintf(os.Stderr,
+				"[bindboss] warning: update check failed (%v) — running cached version %s\n",
+				err, updater.ShortSHA(st.UpdateCommitSHA))
+			result = updater.Result{HasUpdate: false, CommitSHA: st.UpdateCommitSHA}
+		}
+
+		if result.HasUpdate {
+			// GRUG: new version downloaded. verify it's a valid zip first.
+			if err := updater.VerifyArchive(result.ArchivePath); err != nil {
+				os.Remove(result.ArchivePath)
+				fatalf("update archive verification failed: %v", err)
+			}
+
+			// GRUG: extract the new archive into the persist dir.
+			// this replaces all old files with new ones from the repo.
+			if err := updater.ExtractArchive(result.ArchivePath, extractDir); err != nil {
+				os.Remove(result.ArchivePath)
+				fatalf("update extraction failed: %v", err)
+			}
+
+			// GRUG: clean up the downloaded zip file. don't leave garbage around.
+			if err := os.Remove(result.ArchivePath); err != nil {
+				fmt.Fprintf(os.Stderr, "[bindboss] warning: could not remove update archive: %v\n", err)
+			}
+
+			// GRUG: reload config from the freshly extracted directory.
+			// the update might have changed bindboss.toml. read it again.
+			cfg, err = config.Load(extractDir)
+			if err != nil {
+				fatalf("%v", err)
+			}
+			cfg, err = config.Validate(cfg)
+			if err != nil {
+				fatalf("%v", err)
+			}
+			if cfg.Name == "" {
+				cfg.Name = binaryName
+			}
+
+			// GRUG: force dep re-check after update. new version might have new deps.
+			// nuke the dep state so the dep check runs again on this run.
+			if err := state.Reset(cfg.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "[bindboss] warning: could not reset dep state after update: %v\n", err)
+			}
+
+			fmt.Fprintf(os.Stderr, "[bindboss] update complete: now at commit %s\n", updater.ShortSHA(result.CommitSHA))
+		}
+
+		// GRUG: save the commit SHA we saw (even if no update). throttling
+		// and change detection both depend on this being current.
+		if err := state.MarkUpdateChecked(cfg.Name, result.CommitSHA); err != nil {
+			fmt.Fprintf(os.Stderr, "[bindboss] warning: could not save update state: %v\n", err)
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -342,10 +452,66 @@ func runWithSignalForwarding(cmdPath string, argv []string, env []string, workDi
 	return 0
 }
 
+// peekConfigFromPayload reads bindboss.toml from the tar.gz payload without
+// fully extracting. Returns a Config with just enough info to determine
+// extract settings (persist, dir). The reader is consumed after this call.
+//
+// GRUG: grug need to know persist mode before extracting. but config is in
+// the archive. peek reads just bindboss.toml from the tar.gz. fast. simple.
+// reader is dead after this — caller must reopen for full extraction.
+func peekConfigFromPayload(r io.Reader) (config.Config, error) {
+	data, err := archive.ReadFileFromTarGz(r, config.ConfigFileName)
+	if err != nil {
+		// GRUG: no bindboss.toml in archive = use defaults. not an error.
+		// caller must provide --run at minimum, but extract settings are optional.
+		return config.DefaultConfig(), nil
+	}
+	cfg, err := config.LoadFromBytes(data)
+	if err != nil {
+		return cfg, err
+	}
+	return cfg, nil
+}
+
 // resolveExtractDir determines where to extract the packed directory.
 // Returns (dir, cleanupFn, error). cleanupFn is nil if no cleanup is needed.
-func resolveExtractDir(binaryName string) (string, func(), error) {
-	// GRUG: always use fresh tmpdir for now. persist mode = future work.
+//
+// GRUG: two modes:
+//   persist=false = fresh tmpdir every run. cleanup on exit.
+//   persist=true  = fixed dir under ~/.bindboss/<name>/. survives across runs.
+//                    no cleanup. faster for big runtimes. required for updates.
+//
+// GRUG: if cfg.Extract.Dir is set, use that as the persist location.
+// this lets the user override where the extracted files live.
+// useful for putting them on a fast disk or specific filesystem.
+func resolveExtractDir(binaryName string, cfg config.Config) (string, func(), error) {
+	if cfg.Extract.Persist {
+		var persistDir string
+		if cfg.Extract.Dir != "" {
+			// GRUG: user-specified extract dir. use it directly.
+			persistDir = cfg.Extract.Dir
+		} else {
+			// GRUG: default persist dir = ~/.bindboss/<name>/
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", nil, fmt.Errorf(
+					"!!! FATAL: cannot find home directory for persist extract: %w", err)
+			}
+			persistDir = filepath.Join(home, ".bindboss", binaryName)
+		}
+
+		// GRUG: create persist dir if it doesn't exist. MkdirAll is idempotent.
+		if err := os.MkdirAll(persistDir, 0755); err != nil {
+			return "", nil, fmt.Errorf(
+				"!!! FATAL: cannot create persist directory %q: %w", persistDir, err)
+		}
+
+		// GRUG: persist mode = no cleanup. files survive across runs.
+		// this is the whole point of persist mode.
+		return persistDir, nil, nil
+	}
+
+	// GRUG: non-persist mode = fresh tmpdir every run. cleanup on exit.
 	// tmpdir named after binary so `ls /tmp` is readable.
 	dir, err := os.MkdirTemp("", "bindboss-"+binaryName+"-*")
 	if err != nil {
@@ -444,7 +610,13 @@ func runInstallWizard(cfg config.Config, extractDir string) error {
 }
 
 // fatalf prints a fatal error to stderr and exits 1. Never silent.
+//
+// GRUG: if the incoming message already starts with "!!! FATAL:" (because it
+// came from a lower-level error that already formatted itself), strip the
+// prefix so we don't print "!!! FATAL: !!! FATAL: ..." like a goofball.
 func fatalf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "[bindboss] !!! FATAL: "+format+"\n", args...)
+	msg := fmt.Sprintf(format, args...)
+	msg = strings.TrimPrefix(msg, "!!! FATAL: ")
+	fmt.Fprintf(os.Stderr, "[bindboss] !!! FATAL: %s\n", msg)
 	os.Exit(1)
 }

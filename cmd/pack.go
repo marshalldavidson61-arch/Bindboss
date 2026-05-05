@@ -68,13 +68,15 @@ import (
 
 // PackCmd implements `bindboss pack`.
 type PackCmd struct {
-	fs      *flag.FlagSet
-	run     string
-	needs   multiFlag
-	persist bool
-	target  string // GOOS/GOARCH e.g. "linux/amd64"
-	dir     string // extract dir override
-	sign    string // path to .key file for Ed25519 signing
+	fs           *flag.FlagSet
+	run          string
+	needs        multiFlag
+	persist      bool
+	target       string // GOOS/GOARCH e.g. "linux/amd64"
+	dir          string // extract dir override
+	sign         string // path to .key file for Ed25519 signing
+	updateURL    string // GitHub repo URL for remote update checking
+	updateBranch string // branch to track for updates (empty = "main")
 }
 
 func NewPackCmd() *PackCmd {
@@ -85,6 +87,8 @@ func NewPackCmd() *PackCmd {
 	c.fs.StringVar(&c.target, "target", "", "cross-compile target as GOOS/GOARCH (default: current platform)")
 	c.fs.StringVar(&c.dir, "dir", "", "override extract directory (default: ~/.bindboss/<name>/)")
 	c.fs.StringVar(&c.sign, "sign", "", "path to Ed25519 private key file for payload signing (generated with `bindboss keygen`)")
+	c.fs.StringVar(&c.updateURL, "update", "", "GitHub repo URL for remote update checking (e.g. https://github.com/owner/repo)")
+	c.fs.StringVar(&c.updateBranch, "update-branch", "", "branch to track for updates (default: main)")
 	return c
 }
 
@@ -99,6 +103,7 @@ func (c *PackCmd) Usage() string {
     bindboss pack ./grugbot grugbot --run="julia main.jl" --needs="julia,julia --version,https://julialang.org/downloads/"
     bindboss pack ./webapp webapp --run="bun run index.ts" --needs="bun,bun --version,https://bun.sh" --persist
     bindboss pack ./app app --run="./app" --sign=~/.bindboss/keys/mykey.key
+    bindboss pack ./tool tool --run="./tool" --update=https://github.com/owner/repo --persist
 
   Flags:`
 }
@@ -155,8 +160,22 @@ func (c *PackCmd) Run(args []string) error {
 		return err
 	}
 
+	// GRUG: merge update flags into config. separate from MergeFlags
+	// because update has its own --update flag group.
+	cfg = config.MergeUpdateFlags(cfg, c.updateURL, c.updateBranch)
+
+	// GRUG: validate update URL format early. bad URL = fatal now, not at runtime.
+	if cfg.Update.URL != "" {
+		validated, err := config.ParseUpdateURL(cfg.Update.URL)
+		if err != nil {
+			return err
+		}
+		cfg.Update.URL = validated
+	}
+
 	// GRUG: validate after merge. run command must be set by now.
-	if err := config.Validate(cfg); err != nil {
+	cfg, err = config.Validate(cfg)
+	if err != nil {
 		return err
 	}
 
@@ -247,6 +266,13 @@ func (c *PackCmd) Run(args []string) error {
 	}
 	if len(cfg.Hooks.PostRun) > 0 {
 		fmt.Printf("[bindboss]   post_run hooks: %d (exec_mode=fork required on Unix)\n", len(cfg.Hooks.PostRun))
+	}
+	if cfg.Update.URL != "" {
+		fmt.Printf("[bindboss]   update: %s", cfg.Update.URL)
+		if cfg.Update.Branch != "" {
+			fmt.Printf(" (branch: %s)", cfg.Update.Branch)
+		}
+		fmt.Println()
 	}
 
 	return nil

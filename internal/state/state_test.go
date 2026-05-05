@@ -149,3 +149,102 @@ func TestEmptyNameFails(t *testing.T) {
 		t.Errorf("error should contain FATAL, got: %v", err)
 	}
 }
+// TestMarkUpdateCheckedAndLoad verifies that MarkUpdateChecked persists and loads
+// update-related fields correctly.
+func TestMarkUpdateCheckedAndLoad(t *testing.T) {
+	name := "test-update-state"
+
+	// First, mark dep checked so we have a base state
+	if err := state.MarkChecked(name); err != nil {
+		t.Fatalf("MarkChecked: %v", err)
+	}
+
+	// Now mark update checked
+	if err := state.MarkUpdateChecked(name, "abc123def456"); err != nil {
+		t.Fatalf("MarkUpdateChecked: %v", err)
+	}
+
+	s, err := state.Load(name)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Dep state should still be preserved
+	if !s.Checked {
+		t.Error("Checked should still be true after MarkUpdateChecked")
+	}
+	if s.CheckedAt == 0 {
+		t.Error("CheckedAt should not be zero after MarkChecked")
+	}
+
+	// Update state should be set
+	if s.UpdateCommitSHA != "abc123def456" {
+		t.Errorf("UpdateCommitSHA: got %q, want %q", s.UpdateCommitSHA, "abc123def456")
+	}
+	if s.UpdateCheckedAt == 0 {
+		t.Error("UpdateCheckedAt should not be zero after MarkUpdateChecked")
+	}
+}
+
+// TestMarkUpdateCheckedOverwritesSHA verifies that a second update check
+// replaces the old commit SHA.
+func TestMarkUpdateCheckedOverwritesSHA(t *testing.T) {
+	name := "test-update-overwrite"
+
+	if err := state.MarkUpdateChecked(name, "first-sha"); err != nil {
+		t.Fatalf("first MarkUpdateChecked: %v", err)
+	}
+
+	s1, err := state.Load(name)
+	if err != nil {
+		t.Fatalf("Load after first: %v", err)
+	}
+	if s1.UpdateCommitSHA != "first-sha" {
+		t.Fatalf("first SHA: got %q, want %q", s1.UpdateCommitSHA, "first-sha")
+	}
+
+	if err := state.MarkUpdateChecked(name, "second-sha"); err != nil {
+		t.Fatalf("second MarkUpdateChecked: %v", err)
+	}
+
+	s2, err := state.Load(name)
+	if err != nil {
+		t.Fatalf("Load after second: %v", err)
+	}
+	if s2.UpdateCommitSHA != "second-sha" {
+		t.Errorf("second SHA: got %q, want %q", s2.UpdateCommitSHA, "second-sha")
+	}
+}
+
+// TestStateRoundTripWithUpdate verifies serialize/parse round-trip with update fields.
+func TestStateRoundTripWithUpdate(t *testing.T) {
+	original := state.State{
+		Checked:         true,
+		CheckedAt:       1234567890,
+		UpdateCommitSHA: "abc123def456",
+		UpdateCheckedAt: 1234567900,
+	}
+
+	name := "test-roundtrip-update"
+	if err := state.Save(name, original); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	loaded, err := state.Load(name)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if loaded.Checked != original.Checked {
+		t.Errorf("Checked: got %v, want %v", loaded.Checked, original.Checked)
+	}
+	if loaded.CheckedAt != original.CheckedAt {
+		t.Errorf("CheckedAt: got %d, want %d", loaded.CheckedAt, original.CheckedAt)
+	}
+	if loaded.UpdateCommitSHA != original.UpdateCommitSHA {
+		t.Errorf("UpdateCommitSHA: got %q, want %q", loaded.UpdateCommitSHA, original.UpdateCommitSHA)
+	}
+	if loaded.UpdateCheckedAt != original.UpdateCheckedAt {
+		t.Errorf("UpdateCheckedAt: got %d, want %d", loaded.UpdateCheckedAt, original.UpdateCheckedAt)
+	}
+}

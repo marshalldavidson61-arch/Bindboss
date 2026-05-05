@@ -129,6 +129,14 @@ type PackOptions struct {
 	// PrivKey is an optional Ed25519 private key for signing the payload.
 	// nil = pack without signature (hash still stored in v2 trailer).
 	PrivKey ed25519.PrivateKey
+
+	// UpdateURL is the GitHub repo URL for remote update checking.
+	// Empty = no update checking. Format: https://github.com/owner/repo
+	UpdateURL string
+
+	// UpdateBranch is the branch to track for updates.
+	// Empty = "main".
+	UpdateBranch string
 }
 
 // Info describes the contents of a packed binary, returned by Inspect.
@@ -163,6 +171,12 @@ type Info struct {
 
 	// V1 is true if this binary uses the legacy v1 trailer format (no hash/sig).
 	V1 bool
+
+	// UpdateURL is the configured GitHub repo URL for remote updates.
+	UpdateURL string
+
+	// UpdateBranch is the configured branch for remote updates.
+	UpdateBranch string
 }
 
 // Pack compiles a stub, stages the source directory, and writes the output binary.
@@ -212,7 +226,14 @@ func Pack(opts PackOptions) error {
 		})
 	}
 
-	if err := config.Validate(cfg); err != nil {
+	// GRUG: merge update config if provided.
+	if opts.UpdateURL != "" {
+		cfg.Update.URL = opts.UpdateURL
+		cfg.Update.Branch = opts.UpdateBranch
+	}
+
+	cfg, err = config.Validate(cfg)
+	if err != nil {
 		return err
 	}
 
@@ -299,16 +320,18 @@ func Inspect(binPath string) (*Info, error) {
 	}
 
 	return &Info{
-		Name:        cfg.Name,
-		Run:         cfg.Run,
-		ExecMode:    cfg.ExecMode,
-		Needs:       needs,
-		Env:         cfg.Env,
-		Hooks:       Hooks{PreRun: cfg.Hooks.PreRun, PostRun: cfg.Hooks.PostRun},
-		Hash:        hashHex,
-		HashPresent: payloadInfo.HashPresent,
-		SigPresent:  payloadInfo.SigPresent,
-		V1:          payloadInfo.V1,
+		Name:         cfg.Name,
+		Run:          cfg.Run,
+		ExecMode:     cfg.ExecMode,
+		Needs:        needs,
+		Env:          cfg.Env,
+		Hooks:        Hooks{PreRun: cfg.Hooks.PreRun, PostRun: cfg.Hooks.PostRun},
+		Hash:         hashHex,
+		HashPresent:  payloadInfo.HashPresent,
+		SigPresent:   payloadInfo.SigPresent,
+		V1:           payloadInfo.V1,
+		UpdateURL:    cfg.Update.URL,
+		UpdateBranch: cfg.Update.Branch,
 	}, nil
 }
 
